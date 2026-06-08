@@ -83,12 +83,11 @@ void PluginEditor::timerCallback() {
         case AccompanyRunner::LoadState::Ready:   s = "ready — streaming"; break;
         case AccompanyRunner::LoadState::Failed:  s = "model load FAILED (check assets)"; break;
     }
-    auto m = proc_.runner().runner().get_metrics();
     juce::String line = juce::String("Engine: ") + s;
     if (proc_.loadState() == AccompanyRunner::LoadState::Ready)
-        line << "   buf " << (int)m.buffer_available << "/" << (int)m.buffer_capacity
-             << "   " << juce::String(m.total_ms, 1) << " ms/frame"
-             << "   drops " << (int)m.dropped_frames;
+        line << "   buf " << (int)(proc_.runner().ring_available() / 1920)
+             << "   " << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame"
+             << "   drops " << (int)proc_.runner().dropped();
     status_.setText(line, juce::dontSendNotification);
 }
 

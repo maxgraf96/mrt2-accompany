@@ -63,11 +63,10 @@ private:
     AccompanyRunner runner_;
     juce::AudioProcessorValueTreeState apvts_;
 
-    // Host grid + bar-aligned capture + chord-MIDI scheduling (M4c).
+    // Host grid + bar-aligned capture (M4c). Chord-MIDI is driven per-frame
+    // inside AccompanyRunner's inference loop; here we only set its phase anchor.
     HostGridClock clock_;
     LoopCapture capture_;
-    MidiScheduler scheduler_;
-    juce::SpinLock schedLock_;                      // guards scheduler_ plan swap
 
     std::thread worker_;
     std::atomic<bool> workerRun_{false};

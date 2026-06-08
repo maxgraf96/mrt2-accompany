@@ -135,23 +135,22 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     const int beatsPerLoop = juce::jmax(1, bars * grid.beats_per_bar);
     capture_.set_loop_length_samples((int)std::llround(beatsPerLoop * grid.samples_per_beat));
 
-    // Engine-frame position from the grid, offset by the model's generate-ahead.
+    // Raw playhead engine-frame (25 fps). The runner adds the ring depth itself
+    // in set_phase, so do NOT add lookahead here (it would double-count).
     const double timeSec = grid.bpm > 0 ? grid.ppq * 60.0 / grid.bpm : 0.0;
-    const long engineFrame = (long)std::llround(timeSec * 25.0) + lookaheadFrames_;
+    const long engineFrame = (long)std::llround(timeSec * 25.0);
 
+    runner_.set_playing(grid.playing);
     if (grid.playing) {
         const int loopIndex = (int)std::floor(grid.ppq / beatsPerLoop);
         const bool boundary = (loopIndex != prevLoopIndex_) || grid.wrapped || grid.started;
         if (boundary) {
             captureReq_.store(true);                 // worker: capture -> analyze -> (maybe) prefill
-            if (grid.wrapped || grid.started) runner_.trigger_transport_reset();  // re-anchor seam
-            juce::SpinLock::ScopedTryLockType l(schedLock_);
-            if (l.isLocked()) scheduler_.resync(engineFrame);
+            if (grid.wrapped || grid.started) runner_.reanchor();  // drain ring at the seam
         }
         prevLoopIndex_ = loopIndex;
-        juce::SpinLock::ScopedTryLockType l(schedLock_);
-        if (l.isLocked() && scheduler_.has_plan())
-            scheduler_.advance_to(engineFrame, runner_);
+        // Anchor the inference loop's per-frame MIDI to the host playhead.
+        runner_.set_phase(engineFrame);
     }
 
     // Produce the AI layer at host SR into the first two output channels.
@@ -242,11 +241,9 @@ void PluginProcessor::workerLoop() {
                 pre.insert(pre.end(), c.stereo48k.begin(), c.stereo48k.end());
         }
         const int preFrames = (int)(pre.size() / 2);
-        if (preFrames > 50)
-            runner_.runner().prefill_state(pre.data(), preFrames);  // stops/restarts inference
+        if (preFrames > 50) runner_.prefill(pre.data(), preFrames);  // stops/restarts inference
 
-        juce::SpinLock::ScopedLockType l(schedLock_);
-        scheduler_.set_plan(plan);
+        runner_.set_plan(plan);  // inference loop conditions it per-frame
     }
 }
 

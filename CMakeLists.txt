@@ -58,6 +58,12 @@ target_sources(m3_condition PRIVATE ${MAGENTA_PATHS_SRC})
 target_link_libraries(m3_condition PRIVATE magentart::core mrt2_analyzer)
 magenta_deploy_metallib(m3_condition)
 
+# ── Diagnostic: AccompanyRunner conditioning, no JUCE ────────────────────────
+add_executable(diag_runner tools/diag_runner.cpp src/AccompanyRunner.cpp ${MAGENTA_PATHS_SRC})
+target_include_directories(diag_runner PRIVATE src "${MAGENTA_COMMON_DIR}/cpp")
+target_link_libraries(diag_runner PRIVATE magentart::core mrt2_analyzer)
+magenta_deploy_metallib(diag_runner)
+
 # ── M4: JUCE plugin (AU / VST3 / Standalone) ─────────────────────────────────
 option(MRT2_BUILD_PLUGIN "Build the JUCE AU/VST3/Standalone plugin" ON)
 if(MRT2_BUILD_PLUGIN)
