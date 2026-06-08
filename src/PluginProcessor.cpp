@@ -161,12 +161,19 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
         runner_.set_phase(engineFrame);
     }
 
-    // Produce the AI layer at host SR into the first two output channels.
+    // Produce the AI layer at host SR into the first two output channels — but
+    // ONLY while the host transport is playing. When stopped, the AI layer is
+    // silent (we don't pull the ring, so the inference loop back-pressures and
+    // idles); the optional dry passthrough below still works for monitoring.
     float* outL = buffer.getWritePointer(0);
     float* outR = buffer.getWritePointer(juce::jmin(1, nOut - 1));
     const double ratio = 48000.0 / hostSampleRate_;
 
-    if (std::abs(ratio - 1.0) < 1e-6) {
+    if (!grid.playing) {
+        std::fill(outL, outL + nBlk, 0.0f);
+        std::fill(outR, outR + nBlk, 0.0f);
+        stageLen_ = 0;  // drop stale resampler input so play-start is clean
+    } else if (std::abs(ratio - 1.0) < 1e-6) {
         runner_.read48k(outL, outR, (size_t)nBlk);
     } else {
         const int needIn = (int)std::ceil(nBlk * ratio) + 2;
