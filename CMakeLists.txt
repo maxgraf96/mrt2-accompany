@@ -110,19 +110,29 @@ if(MRT2_BUILD_PLUGIN)
     # mlx.metallib must sit next to each plugin binary. JUCE's COPY_PLUGIN_AFTER_BUILD
     # installs the bundle BEFORE our post-build runs, so we copy the metallib into
     # both the build artefact AND the standard user install location per format.
+    #
+    # CRITICAL: adding the metallib into Contents/MacOS/ AFTER JUCE ad-hoc-signs the
+    # bundle invalidates the code signature ("a sealed resource is missing or
+    # invalid"), and macOS 15 hosts (Ableton) then silently reject the plugin during
+    # scan. So we RE-SIGN each bundle ad-hoc after dropping the metallib in.
     set(_metallib "${mlx_BINARY_DIR}/mlx/backend/metal/kernels/mlx.metallib")
-    set(_install_AU  "$ENV{HOME}/Library/Audio/Plug-Ins/Components/MRT2-Accompany.component/Contents/MacOS")
-    set(_install_VST3 "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/MRT2-Accompany.vst3/Contents/MacOS")
+    set(_install_bundle_AU  "$ENV{HOME}/Library/Audio/Plug-Ins/Components/MRT2-Accompany.component")
+    set(_install_bundle_VST3 "$ENV{HOME}/Library/Audio/Plug-Ins/VST3/MRT2-Accompany.vst3")
     foreach(fmt Standalone AU VST3)
         if(TARGET MRT2Accompany_${fmt})
+            # Build-tree bundle: drop metallib next to the binary, then re-sign.
             add_custom_command(TARGET MRT2Accompany_${fmt} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E copy_if_different
                     "${_metallib}" "$<TARGET_FILE_DIR:MRT2Accompany_${fmt}>/mlx.metallib"
+                COMMAND codesign --force --deep --sign - --timestamp=none
+                    "$<TARGET_BUNDLE_DIR:MRT2Accompany_${fmt}>"
                 VERBATIM)
-            if(DEFINED _install_${fmt})
+            # Installed bundle (AU/VST3): same — metallib in, then re-sign.
+            if(DEFINED _install_bundle_${fmt})
                 add_custom_command(TARGET MRT2Accompany_${fmt} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E make_directory "${_install_${fmt}}"
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_metallib}" "${_install_${fmt}}/mlx.metallib"
+                    COMMAND ${CMAKE_COMMAND} -E make_directory "${_install_bundle_${fmt}}/Contents/MacOS"
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_metallib}" "${_install_bundle_${fmt}}/Contents/MacOS/mlx.metallib"
+                    COMMAND codesign --force --deep --sign - --timestamp=none "${_install_bundle_${fmt}}"
                     VERBATIM)
             endif()
         endif()
