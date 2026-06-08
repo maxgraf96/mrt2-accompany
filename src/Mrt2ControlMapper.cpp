@@ -121,4 +121,34 @@ MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double f
     return plan;
 }
 
+void MidiScheduler::set_plan(const MidiPlan& plan) {
+    frames_per_loop_ = plan.frames_per_loop;
+    by_frame_.assign(frames_per_loop_ > 0 ? (size_t)frames_per_loop_ : 0, {});
+    for (const auto& e : plan.events) {
+        if (e.frame >= 0 && e.frame < frames_per_loop_)
+            by_frame_[(size_t)e.frame].push_back(e);
+    }
+    last_frame_ = -1;
+}
+
+void MidiScheduler::clear() {
+    by_frame_.clear();
+    frames_per_loop_ = 0;
+    last_frame_ = -1;
+}
+
+void MidiScheduler::advance_to(long engine_frame, NoteSink& sink) {
+    if (frames_per_loop_ <= 0) return;
+    // Never replay more than one full loop of backlog (e.g. first call / big jump).
+    long from = last_frame_;
+    if (engine_frame - from > frames_per_loop_) from = engine_frame - frames_per_loop_;
+    for (long f = from + 1; f <= engine_frame; ++f) {
+        long lf = ((f % frames_per_loop_) + frames_per_loop_) % frames_per_loop_;
+        for (const auto& e : by_frame_[(size_t)lf]) {
+            if (e.on) sink.note_on(e.pitch); else sink.note_off(e.pitch);
+        }
+    }
+    last_frame_ = engine_frame;
+}
+
 }  // namespace mrt2

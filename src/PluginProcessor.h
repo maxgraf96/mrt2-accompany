@@ -8,10 +8,13 @@
 #pragma once
 #include "AccompanyRunner.h"
 #include "Mrt2ControlMapper.h"
+#include "HostGridClock.h"
+#include "LoopCapture.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <atomic>
 #include <string>
+#include <thread>
 
 namespace mrt2 {
 
@@ -54,9 +57,26 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout makeParams();
     Knobs knobsFromParams() const;
+    HostTransport readTransport(int numSamples);  // playhead -> transport (or synth)
+    void workerLoop();                              // background analyze + prefill
 
     AccompanyRunner runner_;
     juce::AudioProcessorValueTreeState apvts_;
+
+    // Host grid + bar-aligned capture + chord-MIDI scheduling (M4c).
+    HostGridClock clock_;
+    LoopCapture capture_;
+    MidiScheduler scheduler_;
+    juce::SpinLock schedLock_;                      // guards scheduler_ plan swap
+
+    std::thread worker_;
+    std::atomic<bool> workerRun_{false};
+    std::atomic<bool> captureReq_{false};          // audio -> worker: capture+analyze
+    std::atomic<double> curBpm_{120.0};
+    std::atomic<int> curBeatsPerBar_{4};
+    std::atomic<bool> playing_{false};
+    std::int64_t synthSamplePos_ = 0;              // standalone free-running transport
+    int prevLoopIndex_ = -1;                        // loop-boundary edge detector
 
     // Output resampling (engine 48 kHz -> host SR) with persistent state.
     juce::WindowedSincInterpolator resampler_[2];

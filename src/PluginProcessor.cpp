@@ -3,7 +3,9 @@
 
 #include "magenta_paths.h"
 
+#include <chrono>
 #include <cmath>
+#include <vector>
 
 namespace mrt2 {
 
@@ -26,6 +28,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"variation", 1}, "Variation", 0, 15, 0));
     p.push_back(std::make_unique<P>(juce::ParameterID{"drymix", 1}, "Dry Mix", R{0.f, 1.f}, 0.0f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"outgain", 1}, "Output Gain", R{-24.f, 12.f}, 0.0f));
+    p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"bars", 1}, "Loop Bars", 1, 8, 4));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"bpm", 1}, "BPM (Standalone)", R{40.f, 240.f}, 120.f));
+    p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"keytonic", 1}, "Key", 0, 11, 9));
+    p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"keymajor", 1}, "Major Key", false));
     return { p.begin(), p.end() };
 }
 
@@ -39,9 +45,14 @@ PluginProcessor::PluginProcessor()
     runner_.load_async(magentart::paths::get_resources_dir(),
                        magentart::paths::get_default_model_dir() + "/mrt2_base.mlxfn",
                        magentart::paths::get_spectrostream_dir() + "/spectrostream_encoder.mlxfn");
+    workerRun_.store(true);
+    worker_ = std::thread([this] { workerLoop(); });
 }
 
-PluginProcessor::~PluginProcessor() = default;
+PluginProcessor::~PluginProcessor() {
+    workerRun_.store(false);
+    if (worker_.joinable()) worker_.join();
+}
 
 bool PluginProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
     if (layouts.getMainOutputChannelSet() != juce::AudioChannelSet::stereo())
@@ -66,6 +77,35 @@ void PluginProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     tmpL_.assign((size_t)(cap + 16), 0.0f);
     tmpR_.assign((size_t)(cap + 16), 0.0f);
     stageLen_ = 0;
+
+    clock_.reset();
+    capture_.prepare(sampleRate, 30.0);
+    synthSamplePos_ = 0;
+}
+
+// Build this block's transport from the host playhead, or synthesize a free-
+// running one (Standalone: BPM param, always-playing) when none is available.
+HostTransport PluginProcessor::readTransport(int numSamples) {
+    HostTransport t;
+    if (auto* ph = getPlayHead()) {
+        if (auto pos = ph->getPosition()) {
+            t.valid = true;
+            t.playing = pos->getIsPlaying();
+            if (auto b = pos->getBpm()) t.bpm = *b;
+            if (auto p = pos->getPpqPosition()) t.ppq = *p;
+            if (auto ts = pos->getTimeSignature()) { t.ts_num = ts->numerator; t.ts_den = ts->denominator; }
+            if (auto s = pos->getTimeInSamples()) t.time_in_samples = *s;
+        }
+    }
+    if (!t.valid) {  // Standalone fallback: free-running grid from the BPM param.
+        t.valid = true; t.playing = true;
+        t.bpm = apvts_.getRawParameterValue("bpm")->load();
+        t.ts_num = 4; t.ts_den = 4;
+        t.ppq = (synthSamplePos_ / hostSampleRate_) * (t.bpm / 60.0);
+        t.time_in_samples = synthSamplePos_;
+        synthSamplePos_ += numSamples;
+    }
+    return t;
 }
 
 void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
@@ -81,6 +121,38 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     juce::AudioBuffer<float> dry(juce::jmax(1, juce::jmin(2, nIn)), nBlk);
     for (int ch = 0; ch < dry.getNumChannels(); ++ch)
         dry.copyFrom(ch, 0, buffer, juce::jmin(ch, nIn - 1 < 0 ? 0 : nIn - 1), 0, nBlk);
+
+    // --- Host grid + bar-aligned capture + chord-MIDI (M4c) ---
+    const HostTransport tr = readTransport(nBlk);
+    const GridState grid = clock_.update(tr, hostSampleRate_);
+    curBpm_.store(grid.bpm); curBeatsPerBar_.store(grid.beats_per_bar); playing_.store(grid.playing);
+
+    // Feed input into the capture ring (buffer still holds input here).
+    if (nIn > 0)
+        capture_.push(buffer.getReadPointer(0), buffer.getReadPointer(juce::jmin(1, nIn - 1)), nBlk);
+
+    const int bars = (int)apvts_.getRawParameterValue("bars")->load();
+    const int beatsPerLoop = juce::jmax(1, bars * grid.beats_per_bar);
+    capture_.set_loop_length_samples((int)std::llround(beatsPerLoop * grid.samples_per_beat));
+
+    // Engine-frame position from the grid, offset by the model's generate-ahead.
+    const double timeSec = grid.bpm > 0 ? grid.ppq * 60.0 / grid.bpm : 0.0;
+    const long engineFrame = (long)std::llround(timeSec * 25.0) + lookaheadFrames_;
+
+    if (grid.playing) {
+        const int loopIndex = (int)std::floor(grid.ppq / beatsPerLoop);
+        const bool boundary = (loopIndex != prevLoopIndex_) || grid.wrapped || grid.started;
+        if (boundary) {
+            captureReq_.store(true);                 // worker: capture -> analyze -> (maybe) prefill
+            if (grid.wrapped || grid.started) runner_.trigger_transport_reset();  // re-anchor seam
+            juce::SpinLock::ScopedTryLockType l(schedLock_);
+            if (l.isLocked()) scheduler_.resync(engineFrame);
+        }
+        prevLoopIndex_ = loopIndex;
+        juce::SpinLock::ScopedTryLockType l(schedLock_);
+        if (l.isLocked() && scheduler_.has_plan())
+            scheduler_.advance_to(engineFrame, runner_);
+    }
 
     // Produce the AI layer at host SR into the first two output channels.
     float* outL = buffer.getWritePointer(0);
@@ -133,7 +205,49 @@ Knobs PluginProcessor::knobsFromParams() const {
     k.follow_input = apvts_.getRawParameterValue("follow")->load();
     k.drums = apvts_.getRawParameterValue("drums")->load() > 0.5f;
     k.variation = (int)apvts_.getRawParameterValue("variation")->load();
-    return k;
+    k.user_key_tonic = (int)apvts_.getRawParameterValue("keytonic")->load();
+    k.user_key_mode = apvts_.getRawParameterValue("keymajor")->load() > 0.5f ? Mode::Major : Mode::Minor;
+    return k;  // register_lo/hi stay -1 (occupancy-aware auto)
+}
+
+// Background worker: on a capture request, snapshot the just-completed loop,
+// analyze it, and — only if the input changed — re-prefill + swap in a fresh
+// chord-MIDI plan. Prefill stops/restarts the inference loop (a brief seam gap),
+// so it must run here, off the audio thread.
+void PluginProcessor::workerLoop() {
+    using namespace std::chrono_literals;
+    while (workerRun_.load()) {
+        if (!captureReq_.exchange(false)) { std::this_thread::sleep_for(20ms); continue; }
+        if (!runner_.ready()) continue;
+
+        CapturedLoop c;
+        if (!capture_.snapshot(c)) continue;
+        if (!capture_.is_change(c)) continue;   // unchanged loop -> keep evolving, no re-prefill
+
+        const double bpm = curBpm_.load();
+        const int beatsPerBar = curBeatsPerBar_.load();
+        const int bars = juce::jmax(1, (int)apvts_.getRawParameterValue("bars")->load());
+
+        Analysis a = analyze_loop(c.mono48k.data(), c.frames48k, 48000.0, bpm, beatsPerBar, bars);
+        MidiPlan plan = build_midi_plan(a, bpm, knobsFromParams());
+
+        // Tile the captured loop up to >= 8 s so RealtimeRunner's fixed 25/25-frame
+        // trim leaves a usable prefill even for 1-2 bar loops (engine-reality flag).
+        constexpr int kMinPrefill = 8 * 48000;
+        std::vector<float> pre;
+        if (c.frames48k > 0) {
+            const int reps = juce::jmax(1, (kMinPrefill + c.frames48k - 1) / c.frames48k);
+            pre.reserve((size_t)c.frames48k * 2 * reps);
+            for (int r = 0; r < reps; ++r)
+                pre.insert(pre.end(), c.stereo48k.begin(), c.stereo48k.end());
+        }
+        const int preFrames = (int)(pre.size() / 2);
+        if (preFrames > 50)
+            runner_.runner().prefill_state(pre.data(), preFrames);  // stops/restarts inference
+
+        juce::SpinLock::ScopedLockType l(schedLock_);
+        scheduler_.set_plan(plan);
+    }
 }
 
 void PluginProcessor::setPrompt(const juce::String& p) {

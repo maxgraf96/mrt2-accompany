@@ -93,4 +93,28 @@ struct NoteSink {
     virtual void note_off(int pitch) = 0;
 };
 
+// Drives a looping MidiPlan onto a NoteSink in sync with an absolute engine-frame
+// position (derived by the host: engine_frame = ppq*60/bpm*25 + lookahead). The
+// onsets land on beat frames -> the model onsets on the grid (the tempo lever).
+// Audio-thread friendly: no allocation in advance_to().
+class MidiScheduler {
+public:
+    void set_plan(const MidiPlan& plan);   // indexes events by loop frame
+    void clear();                          // forget the plan
+    bool has_plan() const { return frames_per_loop_ > 0; }
+
+    // Resync the cursor to `engine_frame` WITHOUT emitting (after a transport
+    // start / loop wrap / prefill) so we don't replay a backlog.
+    void resync(long engine_frame) { last_frame_ = engine_frame; }
+
+    // Emit every event due in (last_frame_, engine_frame], looping by
+    // frames_per_loop. Bounded work even across a large jump.
+    void advance_to(long engine_frame, NoteSink& sink);
+
+private:
+    std::vector<std::vector<MidiEvent>> by_frame_;  // index [loop_frame] -> events
+    int  frames_per_loop_ = 0;
+    long last_frame_ = -1;
+};
+
 }  // namespace mrt2
