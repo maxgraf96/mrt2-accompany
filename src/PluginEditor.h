@@ -27,14 +27,15 @@ private:
     juce::Label promptLabel_;
     juce::TextEditor prompt_;
 
-    juce::Slider freedom_, follow_, dryMix_, outGain_, variation_;
-    juce::Label freedomL_, followL_, dryMixL_, outGainL_, variationL_;
+    juce::Slider freedom_, follow_, dryMix_, outGain_, variation_, bars_;
+    juce::Label freedomL_, followL_, dryMixL_, outGainL_, variationL_, barsL_;
     juce::ToggleButton drums_{"Drums"};
 
-    std::unique_ptr<SliderAttach> freedomA_, followA_, dryMixA_, outGainA_, variationA_;
+    std::unique_ptr<SliderAttach> freedomA_, followA_, dryMixA_, outGainA_, variationA_, barsA_;
     std::unique_ptr<ButtonAttach> drumsA_;
 
-    juce::Label status_;
+    juce::Label status_;     // engine/perf
+    juce::Label transport_;  // host BPM / bars / detected key / lock
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PluginEditor)
 };

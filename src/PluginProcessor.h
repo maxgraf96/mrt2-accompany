@@ -50,6 +50,14 @@ public:
     AccompanyRunner& runner() { return runner_; }
     AccompanyRunner::LoadState loadState() const { return runner_.state(); }
 
+    // Live readout for the UI (what the plugin actually sees / detected).
+    float uiBpm() const { return uiBpm_.load(); }
+    bool  uiPlaying() const { return uiPlaying_.load(); }
+    int   uiKeyTonic() const { return uiKeyTonic_.load(); }   // -1 = none yet
+    bool  uiKeyMajor() const { return uiKeyMajor_.load(); }
+    int   uiLevel() const { return uiLevel_.load(); }          // HarmonyLevel; -1 none
+    bool  uiLocked() const { return uiLocked_.load(); }
+
     // Editor sets the style prompt (message thread).
     void setPrompt(const juce::String& p);
     juce::String getPrompt() const;
@@ -62,6 +70,12 @@ private:
     void workerLoop();                              // background analyze + prefill
 
     std::atomic<bool> loadStarted_{false};
+    std::atomic<float> uiBpm_{0};
+    std::atomic<bool> uiPlaying_{false};
+    std::atomic<int> uiKeyTonic_{-1};
+    std::atomic<bool> uiKeyMajor_{false};
+    std::atomic<int> uiLevel_{-1};
+    std::atomic<bool> uiLocked_{false};
 
     AccompanyRunner runner_;
     juce::AudioProcessorValueTreeState apvts_;

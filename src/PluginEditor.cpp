@@ -32,6 +32,7 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     };
     setupKnob(freedom_, freedomL_, "Freedom", "freedom", freedomA_);
     setupKnob(follow_, followL_, "Follow Input", "follow", followA_);
+    setupKnob(bars_, barsL_, "Loop Bars", "bars", barsA_);
     setupKnob(variation_, variationL_, "Variation", "variation", variationA_);
     setupKnob(dryMix_, dryMixL_, "Dry Mix", "drymix", dryMixA_);
     setupKnob(outGain_, outGainL_, "Out Gain", "outgain", outGainA_);
@@ -39,10 +40,12 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     addAndMakeVisible(drums_);
     drumsA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
 
+    transport_.setJustificationType(juce::Justification::centredLeft);
+    addAndMakeVisible(transport_);
     status_.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(status_);
 
-    setSize(560, 320);
+    setSize(620, 340);
     startTimerHz(5);
 }
 
@@ -61,18 +64,19 @@ void PluginEditor::resized() {
     r.removeFromTop(8);
 
     auto knobRow = r.removeFromTop(110);
-    const int kw = knobRow.getWidth() / 5;
+    const int kw = knobRow.getWidth() / 6;
     auto place = [&](juce::Slider& s, juce::Label& l) {
         auto cell = knobRow.removeFromLeft(kw);
         l.setBounds(cell.removeFromTop(16));
         s.setBounds(cell);
     };
-    place(freedom_, freedomL_); place(follow_, followL_); place(variation_, variationL_);
-    place(dryMix_, dryMixL_); place(outGain_, outGainL_);
+    place(freedom_, freedomL_); place(follow_, followL_); place(bars_, barsL_);
+    place(variation_, variationL_); place(dryMix_, dryMixL_); place(outGain_, outGainL_);
 
     r.removeFromTop(8);
     drums_.setBounds(r.removeFromTop(24).removeFromLeft(120));
-    status_.setBounds(r.removeFromTop(24));
+    transport_.setBounds(r.removeFromTop(22));
+    status_.setBounds(r.removeFromTop(22));
 }
 
 void PluginEditor::timerCallback() {
@@ -89,6 +93,19 @@ void PluginEditor::timerCallback() {
              << "   " << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame"
              << "   drops " << (int)proc_.runner().dropped();
     status_.setText(line, juce::dontSendNotification);
+
+    // Transport / detection readout: what the plugin actually receives + found.
+    static const char* kPc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    const int bars = (int)proc_.apvts().getRawParameterValue("bars")->load();
+    juce::String t;
+    t << "Host: " << juce::String(proc_.uiBpm(), 1) << " BPM  "
+      << (proc_.uiPlaying() ? "playing" : "stopped") << "   Bars " << bars;
+    if (proc_.uiKeyTonic() >= 0) {
+        const char* lvl = proc_.uiLevel() == 0 ? "chords" : proc_.uiLevel() == 1 ? "key-scale" : "atonal";
+        t << "   Key " << kPc[proc_.uiKeyTonic() % 12] << (proc_.uiKeyMajor() ? "" : "m")
+          << " (" << lvl << ")   " << (proc_.uiLocked() ? "LOCKED" : "listening…");
+    }
+    transport_.setText(t, juce::dontSendNotification);
 }
 
 }  // namespace mrt2

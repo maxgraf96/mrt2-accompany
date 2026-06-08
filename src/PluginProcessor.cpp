@@ -134,6 +134,8 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     const HostTransport tr = readTransport(nBlk);
     const GridState grid = clock_.update(tr, hostSampleRate_);
     curBpm_.store(grid.bpm); curBeatsPerBar_.store(grid.beats_per_bar); playing_.store(grid.playing);
+    uiBpm_.store((float)grid.bpm); uiPlaying_.store(grid.playing);
+    uiLocked_.store(grid.playing && runner_.has_plan());
 
     // Feed input into the capture ring (buffer still holds input here).
     if (nIn > 0)
@@ -243,6 +245,9 @@ void PluginProcessor::workerLoop() {
         const int bars = juce::jmax(1, (int)apvts_.getRawParameterValue("bars")->load());
 
         Analysis a = analyze_loop(c.mono48k.data(), c.frames48k, 48000.0, bpm, beatsPerBar, bars);
+        uiKeyTonic_.store(a.key.tonic);
+        uiKeyMajor_.store(a.key.mode == Mode::Major);
+        uiLevel_.store((int)a.level);
         MidiPlan plan = build_midi_plan(a, bpm, knobsFromParams());
 
         // Tile the captured loop up to >= 8 s so RealtimeRunner's fixed 25/25-frame
