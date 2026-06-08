@@ -25,3 +25,16 @@ add_executable(m1_prefill tools/m1_prefill.cpp ${MAGENTA_PATHS_SRC})
 target_include_directories(m1_prefill PRIVATE "${MAGENTA_COMMON_DIR}/cpp")
 target_link_libraries(m1_prefill PRIVATE magentart::core)
 magenta_deploy_metallib(m1_prefill)
+
+# ── #6: Key + Chord analyzer (no engine dependency) ──────────────────────────
+add_library(mrt2_analyzer STATIC src/KeyChordAnalyzer.cpp)
+target_include_directories(mrt2_analyzer PUBLIC src)
+
+# ── M2: analyzer validation tool ─────────────────────────────────────────────
+add_executable(m2_analyze tools/m2_analyze.cpp)
+target_link_libraries(m2_analyze PRIVATE mrt2_analyzer)
+
+enable_testing()
+add_executable(test_analyzer tests/test_analyzer.cpp)
+target_link_libraries(test_analyzer PRIVATE mrt2_analyzer)
+add_test(NAME analyzer COMMAND test_analyzer)
