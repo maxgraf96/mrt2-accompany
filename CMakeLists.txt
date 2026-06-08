@@ -26,8 +26,8 @@ target_include_directories(m1_prefill PRIVATE "${MAGENTA_COMMON_DIR}/cpp")
 target_link_libraries(m1_prefill PRIVATE magentart::core)
 magenta_deploy_metallib(m1_prefill)
 
-# ── #6: Key + Chord analyzer (no engine dependency) ──────────────────────────
-add_library(mrt2_analyzer STATIC src/KeyChordAnalyzer.cpp)
+# ── #6 + #7: analyzer + control mapper (no engine dependency) ────────────────
+add_library(mrt2_analyzer STATIC src/KeyChordAnalyzer.cpp src/Mrt2ControlMapper.cpp)
 target_include_directories(mrt2_analyzer PUBLIC src)
 
 # ── M2: analyzer validation tool ─────────────────────────────────────────────
@@ -38,3 +38,14 @@ enable_testing()
 add_executable(test_analyzer tests/test_analyzer.cpp)
 target_link_libraries(test_analyzer PRIVATE mrt2_analyzer)
 add_test(NAME analyzer COMMAND test_analyzer)
+
+add_executable(test_mapper tests/test_mapper.cpp)
+target_link_libraries(test_mapper PRIVATE mrt2_analyzer)
+add_test(NAME mapper COMMAND test_mapper)
+
+# ── M3: chord->MIDI conditioning end-to-end (engine + analyzer + mapper) ──────
+add_executable(m3_condition tools/m3_condition.cpp)
+target_include_directories(m3_condition PRIVATE "${MAGENTA_COMMON_DIR}/cpp")
+target_sources(m3_condition PRIVATE ${MAGENTA_PATHS_SRC})
+target_link_libraries(m3_condition PRIVATE magentart::core mrt2_analyzer)
+magenta_deploy_metallib(m3_condition)
