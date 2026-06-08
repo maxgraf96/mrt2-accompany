@@ -76,6 +76,25 @@ int main() {
         CHECK(progression(a) == "A D E A", "roots A D E A recovered");
     }
 
+    // 4) Atonal/percussive (drum-like noise bursts on each beat): must classify
+    //    as HarmonyLevel::None (low tonality) so the mapper uses the user key.
+    {
+        std::vector<float> buf((size_t)(4 * 4 * 0.5 * SR), 0.0f);
+        unsigned seed = 12345;
+        auto rnd = [&]() { seed = seed * 1103515245u + 12345u; return ((seed >> 16) & 0x7fff) / 16384.0f - 1.0f; };
+        double spb = 0.5;
+        for (int beat = 0; beat < 16; ++beat) {
+            int t0 = (int)(beat * spb * SR);
+            int d = (int)(0.08 * SR);
+            for (int i = 0; i < d && t0 + i < (int)buf.size(); ++i)
+                buf[t0 + i] += 0.4f * rnd() * std::exp(-i / (0.02f * (float)SR));
+        }
+        Analysis a = analyze_loop(buf.data(), (int)buf.size(), SR, 120, 4, 4);
+        std::printf("[atonal] level=%d tonality=%.2f degraded=%d\n", (int)a.level, a.tonality, a.degraded);
+        CHECK(a.level == HarmonyLevel::None, "drum-like input -> HarmonyLevel::None");
+        CHECK(a.degraded, "atonal -> degraded (user key fallback)");
+    }
+
     std::printf(g_fail ? "\nFAILED (%d)\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

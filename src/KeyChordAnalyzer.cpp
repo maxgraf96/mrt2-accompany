@@ -142,6 +142,50 @@ Chroma chroma_from_segment(const float* x, int n, double sample_rate,
     return chroma;
 }
 
+// One whole-loop pass: per-MIDI-pitch energy (register occupancy) + tonality
+// (1 - mean spectral flatness; flatness ~1 = noise/percussive, ~0 = tonal).
+void spectral_profile(const float* x, int n, double sample_rate,
+                      const AnalyzerConfig& cfg,
+                      std::array<float, 128>& pitch_energy, float& tonality) {
+    pitch_energy.fill(0.0f);
+    tonality = 0;
+    if (n <= 0) return;
+    const int D = std::max(1, cfg.decim);
+    std::vector<float> dec; dec.reserve(n / D + 1);
+    double acc = 0; int cnt = 0;
+    for (int i = 0; i < n; ++i) { acc += x[i]; if (++cnt == D) { dec.push_back((float)(acc/D)); acc = 0; cnt = 0; } }
+    const double sr = sample_rate / D;
+    const int N = cfg.fft_size;
+    std::vector<float> w(N);
+    for (int i = 0; i < N; ++i) w[i] = 0.5f * (1.0f - std::cos(2.0f * (float)kPi * i / (N - 1)));
+    const int avail = (int)dec.size(), hop = N / 2;
+    std::vector<std::complex<float>> buf(N);
+    int hops = 0; double flat_sum = 0;
+    for (int start = 0; start + N <= avail || (hops == 0 && avail > 0); start += hop) {
+        for (int i = 0; i < N; ++i) { int idx = start + i; buf[i] = std::complex<float>((idx < avail ? dec[idx] : 0.0f) * w[i], 0.0f); }
+        fft(buf);
+        double log_sum = 0, lin_sum = 0; int bins = 0;
+        for (int k = 1; k < N / 2; ++k) {
+            double f = k * sr / N;
+            if (f < cfg.f_min || f > cfg.f_max) continue;
+            float mag = std::abs(buf[k]);
+            double pitch = 69.0 + 12.0 * std::log2(f / 440.0);
+            int m = (int)std::lround(pitch);
+            if (m >= 0 && m < 128) pitch_energy[m] += mag;
+            log_sum += std::log(mag + 1e-9); lin_sum += mag; ++bins;
+        }
+        if (bins > 0) {
+            double gmean = std::exp(log_sum / bins), amean = lin_sum / bins;
+            flat_sum += amean > 1e-12 ? gmean / amean : 1.0;
+        }
+        ++hops;
+        if (start + N > avail) break;
+    }
+    float s = 0; for (float v : pitch_energy) s += v;
+    if (s > 1e-9f) for (float& v : pitch_energy) v /= s;
+    tonality = hops > 0 ? (float)(1.0 - flat_sum / hops) : 0.0f;
+}
+
 Key detect_key(const Chroma& loop_chroma, float key_conf_floor) {
     float best = -2, second = -2; int bt = 0; Mode bm = Mode::Minor;
     for (int t = 0; t < 12; ++t) {
@@ -252,6 +296,7 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
     normalize(loop);
     a.loop_chroma = loop;
     a.key = detect_key(loop, cfg.key_conf_floor);
+    spectral_profile(mono, n, sample_rate, cfg, a.pitch_energy, a.tonality);
 
     // Per-beat tier selection: a beat is a real, quality-bearing chord only if
     // its best triad correlates well AND that triad's third actually sounds.
@@ -290,7 +335,15 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
         a.key.tonic = root_histogram_tonic(beat_chroma);
         a.key.confidence = std::min(a.key.confidence, cfg.key_conf_floor);
     }
-    a.degraded = sparse || (a.key.confidence < cfg.key_conf_floor);
+
+    // 3-rung harmony level (BRIEF generalized to any input):
+    //   atonal/percussive       -> None  (caller uses the user's Key field)
+    //   pitched but sparse/bass  -> KeyScale
+    //   rich harmony             -> Chords
+    if (a.tonality < cfg.tonal_floor)      a.level = HarmonyLevel::None;
+    else if (sparse)                       a.level = HarmonyLevel::KeyScale;
+    else                                   a.level = HarmonyLevel::Chords;
+    a.degraded = (a.level != HarmonyLevel::Chords);
     return a;
 }
 

@@ -75,6 +75,40 @@ int main() {
     CHECK(hi.temperature > lo.temperature, "freedom raises temperature");
     CHECK(lo.onset_mode == 1, "onset_mode=1 for beat-frame onsets");
 
+    // 6) Occupancy-aware register: input energy low (bass) -> voice HIGH;
+    //    input energy high (arp) -> voice LOW.
+    {
+        // Realistic occupancy: energy reaching into the candidate register band
+        // (a real bassline's harmonics do this). Assert the chosen register
+        // avoids the input's occupied band (complementation), not a fixed pitch.
+        std::array<float, 128> bass{}; for (int p = 40; p <= 57; ++p) bass[p] = 1.0f;
+        std::array<float, 128> high{}; for (int p = 60; p <= 84; ++p) high[p] = 1.0f;
+        auto rb = choose_register(bass);
+        auto rh = choose_register(high);
+        std::printf("[occupancy] bass-input -> [%d,%d]  high-input -> [%d,%d]\n", rb.first, rb.second, rh.first, rh.second);
+        CHECK(rb.first > 57, "bass input -> accompaniment voiced above the bass band");
+        CHECK(rh.first < rb.first, "high input -> voiced lower than for bass input");
+    }
+
+    // 7) Atonal input (HarmonyLevel::None): mapper ignores detected beats and
+    //    voices the USER key (here C major), pulsed once per bar.
+    {
+        Analysis at;
+        at.beats_per_bar = 4; at.bars = 2;
+        at.level = HarmonyLevel::None;
+        at.key.tonic = 5; at.key.mode = Mode::Minor;        // analyzer's (garbage) key
+        for (int i = 0; i < 8; ++i) at.beats.push_back(mk(5, Quality::Dim));  // ignored
+        Knobs uk; uk.user_key_tonic = 0; uk.user_key_mode = Mode::Major;       // user: C major
+        MidiPlan p = build_midi_plan(at, 120.0, uk);
+        std::set<int> on0;
+        for (auto& e : p.events) if (e.on && e.frame == 0) on0.insert(((e.pitch % 12) + 12) % 12);
+        std::set<int> cmaj = {0, 4, 7};
+        CHECK(on0 == cmaj, "atonal -> voices the USER key (C major), not the detected key");
+        // Onsets only at bar starts (frames ~0 and ~50), not every beat.
+        std::set<int> onf; for (auto& e : p.events) if (e.on) onf.insert(e.frame);
+        CHECK((int)onf.size() == 2, "atonal pad re-articulates once per bar (2 bars)");
+    }
+
     std::printf(g_fail ? "\nFAILED (%d)\n" : "\nALL PASS\n", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -29,6 +29,15 @@ using Chroma = std::array<float, 12>;  // pitch-class energy, index 0 = C
 enum class Mode { Major, Minor };
 enum class Quality { Maj, Min, Dim, Unknown };
 
+// How much harmonic control the input affords (BRIEF generalized: any input ->
+// accompaniment). Drives the mapper's conditioning strategy.
+//   Chords   — rich harmony present: lock to detected per-beat chords.
+//   KeyScale — pitched but sparse/ambiguous (bassline, mono melody): lock to
+//              key + roots only (no specific qualities).
+//   None     — atonal/percussive (drum loop): no input harmony; fall back to the
+//              user's Key field with a loose key-scale anchor.
+enum class HarmonyLevel { Chords, KeyScale, None };
+
 struct Key {
     int tonic = 0;          // pitch class 0..11 (0=C)
     Mode mode = Mode::Minor;
@@ -52,8 +61,15 @@ struct Analysis {
     int beats_per_bar = 4;
     int bars = 0;
     Chroma loop_chroma{};       // loop-averaged, normalized (for debugging/UI)
-    bool degraded = false;      // true -> caller should use key-scale only
+    bool degraded = false;      // true -> caller should use key-scale only (== level != Chords)
     float harmonic_richness = 0;// 0 (bass-only) .. 1 (full thirds present)
+
+    HarmonyLevel level = HarmonyLevel::KeyScale;
+    float tonality = 0;         // 0 percussive/atonal .. 1 strongly pitched
+    // Input energy per MIDI pitch (0..127), normalized — the loop's register
+    // occupancy. The mapper voices the accompaniment where this is LOW so the
+    // layer complements the input instead of colliding (generalizes bass-avoid).
+    std::array<float, 128> pitch_energy{};
 };
 
 struct AnalyzerConfig {
@@ -64,6 +80,7 @@ struct AnalyzerConfig {
     float  chord_conf_floor = 0.50f;   // below -> degrade that beat to harmonize
     float  key_conf_floor   = 0.04f;   // below -> Analysis.degraded = true
     float  richness_floor   = 0.22f;   // third-energy ratio below -> sparse/bass
+    float  tonal_floor      = 0.62f;   // tonality below -> HarmonyLevel::None
 };
 
 // Analyze `mono` samples (length `n`) at `sample_rate`, on a known grid.

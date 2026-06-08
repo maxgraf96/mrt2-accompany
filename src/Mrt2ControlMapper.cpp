@@ -11,9 +11,9 @@ EngineParams resolve_params(const Knobs& k) {
     // Keep cfg_musiccoca in a musical band; temp ~1.0..1.4 (M1 found ~1.2 good).
     p.temperature   = 1.0f + 0.5f * std::clamp(k.freedom, 0.0f, 1.0f);   // 1.0..1.5
     p.cfg_musiccoca = 4.5f - 2.0f * std::clamp(k.freedom, 0.0f, 1.0f);   // 4.5..2.5
-    // Follow-harmony: how strictly the model obeys the chord-MIDI. Maps to both
+    // Follow-input: how strictly the model obeys the chord-MIDI. Maps to both
     // cfg_notes (in [-1,7]) and unmask_width (silence corridor around chord tones).
-    float fh = std::clamp(k.follow_harmony, 0.0f, 1.0f);
+    float fh = std::clamp(k.follow_input, 0.0f, 1.0f);
     p.cfg_notes     = 0.5f + 5.5f * fh;                                  // 0.5..6.0
     p.unmask_width  = (int)std::lround(2 + 30 * fh);                     // 2..32 semitones
     p.seed_rotation = k.variation;
@@ -44,6 +44,25 @@ std::vector<int> voice_chord(const Chord& chord, int lo, int hi) {
     return notes;
 }
 
+// Pick a ~1.5-octave register where the input leaves the most room: minimize
+// the input's energy inside the window, over a musically useful range. This
+// generalizes "stay out of the bass" to "complement the input wherever it sits"
+// — bass input pushes the window high, a high arp pushes it lower.
+std::pair<int, int> choose_register(const std::array<float, 128>& pitch_energy) {
+    constexpr int kSpan = 18, kMin = 48, kMax = 84;  // C3..C6 candidate band
+    float best = 1e9f; int best_lo = 60;
+    // Prefix sums for O(1) window energy.
+    std::array<double, 129> pre{};
+    for (int i = 0; i < 128; ++i) pre[i + 1] = pre[i] + pitch_energy[i];
+    for (int lo = kMin; lo + kSpan <= kMax; ++lo) {
+        float e = (float)(pre[lo + kSpan] - pre[lo]);
+        // Gentle bias toward a mid-register home so silent input -> sensible default.
+        float center_bias = 0.002f * std::abs((lo + kSpan / 2) - 66);
+        if (e + center_bias < best) { best = e + center_bias; best_lo = lo; }
+    }
+    return {best_lo, best_lo + kSpan};
+}
+
 MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double fps) {
     MidiPlan plan;
     const int total_beats = (int)a.beats.size();
@@ -51,21 +70,43 @@ MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double f
     plan.frames_per_beat = (60.0 / bpm) * fps;
     plan.frames_per_loop = (int)std::llround(total_beats * plan.frames_per_beat);
 
+    // Register: explicit override, else occupancy-aware auto.
+    int lo = k.register_lo, hi = k.register_hi;
+    if (lo < 0 || hi < 0) { auto r = choose_register(a.pitch_energy); lo = r.first; hi = r.second; }
+
+    // Per-beat voicings by harmony level. None -> the user's key tonic triad,
+    // re-articulated once per BAR (a loose pad anchor), no invented progression.
+    std::vector<std::vector<int>> voicings(total_beats);
+    const bool atonal = (a.level == HarmonyLevel::None);
+    Chord user_tonic; user_tonic.root = k.user_key_tonic;
+    user_tonic.quality = (k.user_key_mode == Mode::Major) ? Quality::Maj : Quality::Min;
+    for (int b = 0; b < total_beats; ++b) {
+        if (atonal) {
+            bool bar_start = (a.beats_per_bar > 0) && (b % a.beats_per_bar == 0);
+            voicings[b] = bar_start ? voice_chord(user_tonic, lo, hi)
+                                    : voicings[b > 0 ? b - 1 : 0];  // hold within the bar
+        } else {
+            voicings[b] = voice_chord(a.beats[b], lo, hi);
+        }
+    }
+
     std::vector<int> held;  // currently sounding pitches
     for (int b = 0; b < total_beats; ++b) {
         int frame = (int)std::llround(b * plan.frames_per_beat);
-        std::vector<int> next = voice_chord(a.beats[b], k.register_lo, k.register_hi);
+        const std::vector<int>& next = voicings[b];
+        bool rearticulate = !atonal || (a.beats_per_bar > 0 && b % a.beats_per_bar == 0);
 
         // Release every held note that is not in `next` (chord change).
         for (int p : held) {
             if (std::find(next.begin(), next.end(), p) == next.end())
                 plan.events.push_back({frame, p, false});
         }
-        // Re-articulate: off then on for tones common to both, so every beat
-        // carries a fresh onset pulse (reinforces the grid for tempo lock).
+        // Re-articulate common tones (off then on) so the beat carries a pulse —
+        // every beat when locked to harmony, once per bar for the atonal pad.
         for (int p : next) {
-            if (std::find(held.begin(), held.end(), p) != held.end())
-                plan.events.push_back({frame, p, false});
+            bool was_held = std::find(held.begin(), held.end(), p) != held.end();
+            if (was_held && !rearticulate) continue;  // sustain through the bar
+            if (was_held) plan.events.push_back({frame, p, false});
             plan.events.push_back({frame, p, true});
         }
         held = next;

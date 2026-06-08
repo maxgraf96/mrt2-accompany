@@ -2,6 +2,7 @@
 //   m2_analyze <loop.wav> --bpm B [--beats-per-bar 4] [--bars N] [--expect "Am Dm E Am"]
 
 #include "../src/KeyChordAnalyzer.h"
+#include "../src/Mrt2ControlMapper.h"
 #include "wav_io.h"
 
 #include <cstdio>
@@ -29,9 +30,13 @@ int main(int argc, char** argv) {
 
     Analysis a = analyze_loop(wav.mono.data(), (int)wav.mono.size(), wav.sample_rate, bpm, bpb, bars);
 
-    std::printf("[m2] KEY: %-9s (conf %.3f)%s   harmonic_richness=%.2f\n",
-                a.key.name().c_str(), a.key.confidence,
-                a.degraded ? "  [DEGRADED -> key-scale only]" : "", a.harmonic_richness);
+    const char* lvl = a.level == HarmonyLevel::Chords ? "Chords"
+                    : a.level == HarmonyLevel::KeyScale ? "KeyScale" : "None";
+    auto reg = choose_register(a.pitch_energy);
+    std::printf("[m2] KEY: %-9s (conf %.3f)   level=%-8s tonality=%.2f richness=%.2f\n",
+                a.key.name().c_str(), a.key.confidence, lvl, a.tonality, a.harmonic_richness);
+    std::printf("[m2] auto register: MIDI [%d,%d]  (accompaniment voiced where input is sparse)\n",
+                reg.first, reg.second);
 
     // Per-bar chord summary (mode of beats in each bar).
     std::printf("[m2] per-bar chords (beat detail):\n");

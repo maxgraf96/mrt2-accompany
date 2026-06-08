@@ -46,7 +46,9 @@ int main(int argc, char** argv) {
         else if (a=="--frames") frames=std::stoi(argv[++i]);
         else if (a=="--prompt") prompt=argv[++i];
         else if (a=="--freedom") k.freedom=std::stof(argv[++i]);
-        else if (a=="--follow") k.follow_harmony=std::stof(argv[++i]);
+        else if (a=="--follow") k.follow_input=std::stof(argv[++i]);
+        else if (a=="--key-tonic") k.user_key_tonic=std::stoi(argv[++i]);
+        else if (a=="--key-major") k.user_key_mode=Mode::Major;
         else if (a=="--out") out=argv[++i];
     }
     WavData wav;
@@ -55,9 +57,18 @@ int main(int argc, char** argv) {
     if (bars <= 0) bars = (int)std::llround(dur*bpm/60.0/4);
 
     Analysis an = analyze_loop(wav.mono.data(), (int)wav.mono.size(), wav.sample_rate, bpm, 4, bars);
-    std::printf("[m3] key=%s%s  progression: ", an.key.name().c_str(), an.degraded?" [degraded]":"");
-    for (int b = 0; b < bars; ++b) std::printf("%s ", an.beats[b*4].name().c_str());
-    std::printf("\n");
+    const char* lvl = an.level == HarmonyLevel::Chords ? "Chords"
+                    : an.level == HarmonyLevel::KeyScale ? "KeyScale" : "None";
+    std::printf("[m3] level=%s tonality=%.2f  ", lvl, an.tonality);
+    if (an.level == HarmonyLevel::None) {
+        const char* pc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+        std::printf("conditioning USER key %s%s (input atonal)\n",
+                    pc[k.user_key_tonic % 12], k.user_key_mode == Mode::Major ? "" : "m");
+    } else {
+        std::printf("key=%s  progression: ", an.key.name().c_str());
+        for (int b = 0; b < bars; ++b) std::printf("%s ", an.beats[b*4].name().c_str());
+        std::printf("\n");
+    }
 
     MidiPlan plan = build_midi_plan(an, bpm, k);
     EngineParams ep = resolve_params(k);
