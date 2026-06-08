@@ -41,17 +41,24 @@ PluginProcessor::PluginProcessor()
           .withOutput("Output", juce::AudioChannelSet::stereo(), true)
           .withInput("Sidechain", juce::AudioChannelSet::stereo(), false)),
       apvts_(*this, nullptr, "PARAMS", makeParams()) {
-    runner_.set_prompt(prompt_.toStdString());  // queue default style before load
-    runner_.load_async(magentart::paths::get_resources_dir(),
-                       magentart::paths::get_default_model_dir() + "/mrt2_base.mlxfn",
-                       magentart::paths::get_spectrostream_dir() + "/spectrostream_encoder.mlxfn");
-    workerRun_.store(true);
-    worker_ = std::thread([this] { workerLoop(); });
+    // Deliberately do NOT load the model here — construction must stay cheap so
+    // host plugin scans (and JUCE's manifest helper) don't load 2.6 GB and abort
+    // on teardown. The heavy load is kicked off from the first prepareToPlay.
+    runner_.set_prompt(prompt_.toStdString());  // queue default style for when we load
 }
 
 PluginProcessor::~PluginProcessor() {
     workerRun_.store(false);
     if (worker_.joinable()) worker_.join();
+}
+
+void PluginProcessor::ensureLoaded() {
+    if (loadStarted_.exchange(true)) return;  // once
+    runner_.load_async(magentart::paths::get_resources_dir(),
+                       magentart::paths::get_default_model_dir() + "/mrt2_base.mlxfn",
+                       magentart::paths::get_spectrostream_dir() + "/spectrostream_encoder.mlxfn");
+    workerRun_.store(true);
+    worker_ = std::thread([this] { workerLoop(); });
 }
 
 bool PluginProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
@@ -62,6 +69,7 @@ bool PluginProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
 }
 
 void PluginProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    ensureLoaded();  // first real use -> kick off the (heavy) model load + worker
     hostSampleRate_ = sampleRate;
     runner_.set_lookahead_frames(lookaheadFrames_);
 

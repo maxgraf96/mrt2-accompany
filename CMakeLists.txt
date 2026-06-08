@@ -86,6 +86,10 @@ if(MRT2_BUILD_PLUGIN)
         NEEDS_MIDI_INPUT FALSE
         NEEDS_MIDI_OUTPUT FALSE
         IS_MIDI_EFFECT FALSE
+        # Skip the build-time VST3 manifest helper: it instantiates the plugin,
+        # which would load the 2.6 GB MLX model and abort on teardown (MLX's
+        # single global Metal stream). Hosts scan the binary directly without it.
+        VST3_AUTO_MANIFEST FALSE
         COPY_PLUGIN_AFTER_BUILD TRUE)
 
     target_sources(MRT2Accompany PRIVATE

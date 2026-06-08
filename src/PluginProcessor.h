@@ -58,7 +58,10 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout makeParams();
     Knobs knobsFromParams() const;
     HostTransport readTransport(int numSamples);  // playhead -> transport (or synth)
+    void ensureLoaded();                            // load model once, on first prepareToPlay
     void workerLoop();                              // background analyze + prefill
+
+    std::atomic<bool> loadStarted_{false};
 
     AccompanyRunner runner_;
     juce::AudioProcessorValueTreeState apvts_;
