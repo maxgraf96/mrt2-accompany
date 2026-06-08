@@ -117,4 +117,20 @@ if(MRT2_BUILD_PLUGIN)
             endif()
         endif()
     endforeach()
+
+    # ── M5: realtime-paced host harness for drift measurement (headless) ─────
+    juce_add_console_app(m5_drift PRODUCT_NAME "m5_drift")
+    target_sources(m5_drift PRIVATE
+        tools/m5_drift.cpp
+        src/PluginProcessor.cpp src/PluginEditor.cpp src/AccompanyRunner.cpp
+        ${MAGENTA_PATHS_SRC})
+    target_include_directories(m5_drift PRIVATE src "${MAGENTA_COMMON_DIR}/cpp")
+    target_compile_definitions(m5_drift PRIVATE
+        JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1)
+    target_link_libraries(m5_drift PRIVATE
+        magentart::core mrt2_analyzer
+        juce::juce_audio_utils juce::juce_recommended_config_flags)
+    add_custom_command(TARGET m5_drift POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_metallib}" "$<TARGET_FILE_DIR:m5_drift>/mlx.metallib" VERBATIM)
 endif()
