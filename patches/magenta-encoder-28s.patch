@@ -1,0 +1,30 @@
+diff --git a/core/src/mlx_engine.cpp b/core/src/mlx_engine.cpp
+index 4bee1c1..db5a2fc 100644
+--- a/core/src/mlx_engine.cpp
++++ b/core/src/mlx_engine.cpp
+@@ -729,7 +729,11 @@ bool MLXEngine::Impl::prefill_state(
+     // so we must always pass exactly that many samples. Audio shorter
+     // than that is zero-padded; longer audio is truncated. Tokens
+     // corresponding to padded samples are excluded by the trim below.
+-    constexpr int kEncoderInputSamples = 2880000;
++    // [mrt2-accompany local patch] Released spectrostream_encoder.mlxfn is traced
++    // at 28 s (1,344,000 samples), not the 60 s (2,880,000) this checkout's code
++    // assumed — the 60 s raw checkpoint isn't publicly fetchable to re-export.
++    // 28 s >> the model's ~19.7 s receptive field, so prefill quality is unaffected.
++    constexpr int kEncoderInputSamples = 1344000;
+     const int caller_audio_frames =
+         num_samples / static_cast<int>(kFrameSamples);
+     const int caller_audio_samples =
+@@ -888,7 +892,11 @@ bool MLXEngine::Impl::ensure_silent_tokens(
+   }
+   try {
+     // Encode a fully-silent 28 s buffer (the encoder's traced shape).
+-    constexpr int kEncoderInputSamples = 2880000;
++    // [mrt2-accompany local patch] Released spectrostream_encoder.mlxfn is traced
++    // at 28 s (1,344,000 samples), not the 60 s (2,880,000) this checkout's code
++    // assumed — the 60 s raw checkpoint isn't publicly fetchable to re-export.
++    // 28 s >> the model's ~19.7 s receptive field, so prefill quality is unaffected.
++    constexpr int kEncoderInputSamples = 1344000;
+     std::vector<float> silent_input(kEncoderInputSamples * 2, 0.0f);
+     mx::array waveform = mx::array(silent_input.data(),
+                                    {1, kEncoderInputSamples, 2}, mx::float32);
