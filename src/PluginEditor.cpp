@@ -4,6 +4,13 @@ namespace mrt2 {
 
 static const char* kPc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
 
+// Build non-ASCII glyphs from code points so they don't depend on how JUCE
+// decodes source-literal bytes (a literal "·" was rendering as "Â·").
+static const juce::String DOT = juce::String::charToString((juce::juce_wchar)0x00B7);  // ·
+static const juce::String ELL = juce::String::charToString((juce::juce_wchar)0x2026);  // …
+static const juce::String DOT_ON  = juce::String::charToString((juce::juce_wchar)0x25CF); // ●
+static const juce::String DOT_OFF = juce::String::charToString((juce::juce_wchar)0x25CB); // ○
+
 void PluginEditor::styleKnob(juce::Slider& s) {
     s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
     s.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
@@ -153,10 +160,10 @@ void PluginEditor::paint(juce::Graphics& g) {
             g.fillRoundedRectangle(bar.withWidth(bar.getWidth() * juce::jlimit(0.0f, 1.0f, proc_.downloadProgress())), 3.0f);
         }
         g.setColour(ui::muted); g.setFont(ui::font(12.5f));
-        g.drawText(as == AS::Downloading ? "downloading model…"
-                   : as == AS::Failed ? "download failed"
-                   : "click the button below to download",
-                   wb.withTrimmedBottom(wb.getHeight() - 22.0f).toNearestInt(),
+        const juce::String dmsg = as == AS::Downloading ? "downloading model" + ELL
+                   : as == AS::Failed ? juce::String("download failed")
+                   : juce::String("click the button below to download");
+        g.drawText(dmsg, wb.withTrimmedBottom(wb.getHeight() - 22.0f).toNearestInt(),
                    juce::Justification::centred, false);
     } else if (!wave_.empty()) {
         const float mid = wb.getCentreY(), hh = wb.getHeight() * 0.42f;
@@ -169,7 +176,7 @@ void PluginEditor::paint(juce::Graphics& g) {
         }
     } else {
         g.setColour(ui::faint); g.setFont(ui::font(13.0f));
-        g.drawText(proc_.uiPlaying() ? "listening for a loop…" : "play your loop to capture",
+        g.drawText(proc_.uiPlaying() ? "listening for a loop" + ELL : juce::String("play your loop to capture"),
                    waveBounds_, juce::Justification::centred, false);
     }
     g.setColour(ui::muted); g.setFont(ui::font(12.5f));
@@ -189,7 +196,7 @@ void PluginEditor::paint(juce::Graphics& g) {
     }
 
     line(keyHdr_.getY() - 8);
-    sectionLabel(g, keyHdr_, "Key  ·  override");
+    sectionLabel(g, keyHdr_, "Key  " + DOT + "  override");
 
     g.setColour(ui::muted); g.setFont(ui::font(12.0f));
     g.drawText(statusLine_, juce::Rectangle<int>(full.getX(), relock_.getBottom() + 8,
@@ -210,7 +217,7 @@ void PluginEditor::timerCallback() {
             relock_.setEnabled(true);
             detectLine_ = "Model not found locally — a one-time download is required.";
         } else if (as == AS::Downloading) {
-            relock_.setButtonText("Downloading…  " + juce::String(pct) + "%");
+            relock_.setButtonText("Downloading" + ELL + "  " + juce::String(pct) + "%");
             relock_.setEnabled(false);
             detectLine_ = proc_.downloadStatus();
         } else {
@@ -227,10 +234,10 @@ void PluginEditor::timerCallback() {
 
     juce::String line = "Engine: ";
     switch (proc_.loadState()) {
-        case AccompanyRunner::LoadState::Loading: line << "loading model…"; break;
+        case AccompanyRunner::LoadState::Loading: line << "loading model" << ELL; break;
         case AccompanyRunner::LoadState::Ready:
-            line << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame · buf "
-                 << (int)(proc_.runner().ring_available() / 1920) << " · drops "
+            line << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame  " << DOT << "  buf "
+                 << (int)(proc_.runner().ring_available() / 1920) << "  " << DOT << "  drops "
                  << (int)proc_.runner().dropped(); break;
         case AccompanyRunner::LoadState::Failed: line << "load FAILED (check assets)"; break;
         default: line << "idle"; break;
@@ -243,9 +250,9 @@ void PluginEditor::timerCallback() {
     if (proc_.uiKeyTonic() >= 0) {
         const char* lv = proc_.uiLevel() == 0 ? "chords" : proc_.uiLevel() == 1 ? "key-scale" : "atonal";
         d << kPc[proc_.uiKeyTonic() % 12] << (proc_.uiKeyMajor() ? " maj" : " min")
-          << " · " << lv << "   " << (proc_.uiLocked() ? "● LOCKED" : "○ listening…");
+          << "  " << DOT << "  " << lv << "   " << (proc_.uiLocked() ? DOT_ON + " LOCKED" : DOT_OFF + " listening" + ELL);
     } else {
-        d << (proc_.uiPlaying() ? "listening…" : "stopped");
+        d << (proc_.uiPlaying() ? "listening" + ELL : juce::String("stopped"));
     }
     detectLine_ = d;
     repaint();
