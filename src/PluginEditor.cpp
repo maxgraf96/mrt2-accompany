@@ -40,6 +40,23 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     addAndMakeVisible(drums_);
     drumsA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
 
+    // Key override controls.
+    keyLabel_.setText("Key", juce::dontSendNotification);
+    addAndMakeVisible(keyLabel_);
+    static const char* kPc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+    for (int i = 0; i < 12; ++i) keyBox_.addItem(kPc[i], i + 1);  // ids 1..12
+    addAndMakeVisible(keyBox_);
+    keyA_ = std::make_unique<ComboAttach>(proc_.apvts(), "keytonic", keyBox_);
+    addAndMakeVisible(keyMajor_);
+    keyMajorA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keymajor", keyMajor_);
+    addAndMakeVisible(keyLock_);
+    keyLockA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
+    keyLock_.onStateChange = [this] {
+        const bool on = keyLock_.getToggleState();   // grey out tonic/major when Auto
+        keyBox_.setEnabled(on); keyMajor_.setEnabled(on);
+    };
+    keyLock_.onStateChange();
+
     transport_.setJustificationType(juce::Justification::centredLeft);
     addAndMakeVisible(transport_);
     status_.setJustificationType(juce::Justification::centredLeft);
@@ -74,7 +91,15 @@ void PluginEditor::resized() {
     place(variation_, variationL_); place(dryMix_, dryMixL_); place(outGain_, outGainL_);
 
     r.removeFromTop(8);
-    drums_.setBounds(r.removeFromTop(24).removeFromLeft(120));
+    auto ctlRow = r.removeFromTop(26);
+    drums_.setBounds(ctlRow.removeFromLeft(80));
+    ctlRow.removeFromLeft(16);
+    keyLabel_.setBounds(ctlRow.removeFromLeft(32));
+    keyBox_.setBounds(ctlRow.removeFromLeft(64).reduced(0, 2));
+    ctlRow.removeFromLeft(8);
+    keyMajor_.setBounds(ctlRow.removeFromLeft(80));
+    keyLock_.setBounds(ctlRow.removeFromLeft(100));
+    r.removeFromTop(6);
     transport_.setBounds(r.removeFromTop(22));
     status_.setBounds(r.removeFromTop(22));
 }

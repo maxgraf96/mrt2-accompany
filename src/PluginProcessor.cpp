@@ -32,6 +32,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<P>(juce::ParameterID{"bpm", 1}, "BPM (Standalone)", R{40.f, 240.f}, 120.f));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"keytonic", 1}, "Key", 0, 11, 9));
     p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"keymajor", 1}, "Major Key", false));
+    p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"keylock", 1}, "Lock Key", false));
     return { p.begin(), p.end() };
 }
 
@@ -244,7 +245,12 @@ void PluginProcessor::workerLoop() {
         const int beatsPerBar = curBeatsPerBar_.load();
         const int bars = juce::jmax(1, (int)apvts_.getRawParameterValue("bars")->load());
 
-        Analysis a = analyze_loop(c.mono48k.data(), c.frames48k, 48000.0, bpm, beatsPerBar, bars);
+        AnalyzerConfig acfg;
+        if (apvts_.getRawParameterValue("keylock")->load() > 0.5f) {
+            acfg.key_lock_tonic = (int)apvts_.getRawParameterValue("keytonic")->load();
+            acfg.key_lock_major = apvts_.getRawParameterValue("keymajor")->load() > 0.5f;
+        }
+        Analysis a = analyze_loop(c.mono48k.data(), c.frames48k, 48000.0, bpm, beatsPerBar, bars, acfg);
         uiKeyTonic_.store(a.key.tonic);
         uiKeyMajor_.store(a.key.mode == Mode::Major);
         uiLevel_.store((int)a.level);

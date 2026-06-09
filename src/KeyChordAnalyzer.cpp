@@ -296,6 +296,14 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
     normalize(loop);
     a.loop_chroma = loop;
     a.key = detect_key(loop, cfg.key_conf_floor);
+    // User key override drives chord harmonization + reporting (e.g. force minor
+    // on a bassline where major/minor is acoustically unresolvable).
+    const bool key_locked = cfg.key_lock_tonic >= 0;
+    if (key_locked) {
+        a.key.tonic = cfg.key_lock_tonic % 12;
+        a.key.mode = cfg.key_lock_major ? Mode::Major : Mode::Minor;
+        a.key.confidence = 1.0f;
+    }
     spectral_profile(mono, n, sample_rate, cfg, a.pitch_energy, a.tonality);
 
     // Per-beat tier selection: a beat is a real, quality-bearing chord only if
@@ -331,7 +339,7 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
     // but major/minor is not observable. Anchor the tonic to the duration-
     // weighted bass-root histogram, drop confidence, and degrade to key-scale.
     const bool sparse = templated * 2 < total_beats;  // majority lacked a third
-    if (sparse) {
+    if (sparse && !key_locked) {
         a.key.tonic = root_histogram_tonic(beat_chroma);
         a.key.confidence = std::min(a.key.confidence, cfg.key_conf_floor);
     }

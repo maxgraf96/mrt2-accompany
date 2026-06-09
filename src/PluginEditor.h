@@ -34,6 +34,14 @@ private:
     std::unique_ptr<SliderAttach> freedomA_, followA_, dryMixA_, outGainA_, variationA_, barsA_;
     std::unique_ptr<ButtonAttach> drumsA_;
 
+    // Key override: Lock + tonic + major/minor.
+    juce::Label keyLabel_;
+    juce::ComboBox keyBox_;
+    juce::ToggleButton keyMajor_{"Major"}, keyLock_{"Lock Key"};
+    using ComboAttach = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+    std::unique_ptr<ComboAttach> keyA_;
+    std::unique_ptr<ButtonAttach> keyMajorA_, keyLockA_;
+
     juce::Label status_;     // engine/perf
     juce::Label transport_;  // host BPM / bars / detected key / lock
 

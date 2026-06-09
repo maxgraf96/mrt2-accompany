@@ -81,6 +81,11 @@ struct AnalyzerConfig {
     float  key_conf_floor   = 0.04f;   // below -> Analysis.degraded = true
     float  richness_floor   = 0.22f;   // third-energy ratio below -> sparse/bass
     float  tonal_floor      = 0.62f;   // tonality below -> HarmonyLevel::None
+    // Key override: -1 = auto-detect (Krumhansl-Schmuckler). Otherwise force this
+    // tonic (0..11) + mode, used as the tonal centre for chord harmonization and
+    // reporting. Useful because a bassline can't disambiguate major/minor.
+    int    key_lock_tonic   = -1;
+    bool   key_lock_major   = false;
 };
 
 // Analyze `mono` samples (length `n`) at `sample_rate`, on a known grid.
