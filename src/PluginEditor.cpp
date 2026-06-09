@@ -53,14 +53,12 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     scaleBox_.setLookAndFeel(&lnf_);
     addAndMakeVisible(scaleBox_);
     scaleA_ = std::make_unique<ComboAttach>(proc_.apvts(), "keymajor", scaleBox_);
+    // Picking a key/scale engages Lock (so the dropdowns "just work"); the Lock
+    // toggle stays as the explicit Auto<->Lock control.
+    keyBox_.addListener(this); scaleBox_.addListener(this);
     for (auto* t : { &keyLock_, &drums_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
     keyLockA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
     drumsA_   = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
-    keyLock_.onStateChange = [this] {
-        const bool on = keyLock_.getToggleState();
-        keyBox_.setEnabled(on); scaleBox_.setEnabled(on); repaint();
-    };
-    keyLock_.onStateChange();
 
     relock_.setLookAndFeel(&lnf_);
     relock_.onClick = [this] {
@@ -74,9 +72,18 @@ PluginEditor::PluginEditor(PluginProcessor& p)
 
     setSize(560, 560);
     startTimerHz(8);
+    constructed_ = true;
+}
+
+void PluginEditor::comboBoxChanged(juce::ComboBox* c) {
+    // A user pick of Key or Scale implies they want to override -> engage Lock.
+    if (constructed_ && (c == &keyBox_ || c == &scaleBox_))
+        if (auto* p = proc_.apvts().getParameter("keylock"))
+            p->setValueNotifyingHost(1.0f);
 }
 
 PluginEditor::~PluginEditor() {
+    keyBox_.removeListener(this); scaleBox_.removeListener(this);
     setLookAndFeel(nullptr);
     for (auto& k : knobs_) k.s->setLookAndFeel(nullptr);
 }

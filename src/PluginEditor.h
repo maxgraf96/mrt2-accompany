@@ -7,7 +7,9 @@
 
 namespace mrt2 {
 
-class PluginEditor : public juce::AudioProcessorEditor, private juce::Timer {
+class PluginEditor : public juce::AudioProcessorEditor,
+                     private juce::Timer,
+                     private juce::ComboBox::Listener {
 public:
     explicit PluginEditor(PluginProcessor&);
     ~PluginEditor() override;
@@ -17,7 +19,10 @@ public:
 
 private:
     void timerCallback() override;
+    void comboBoxChanged(juce::ComboBox*) override;  // auto-engage Lock on key/scale pick
     void styleKnob(juce::Slider&);
+
+    bool constructed_ = false;  // suppress the auto-lock during attachment init
 
     using SliderAttach = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAttach = juce::AudioProcessorValueTreeState::ButtonAttachment;
