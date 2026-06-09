@@ -31,10 +31,10 @@ private:
     juce::Slider freedom_, follow_, bars_, variation_, dryMix_, outGain_;
     std::unique_ptr<SliderAttach> freedomA_, followA_, barsA_, variationA_, dryMixA_, outGainA_;
 
-    juce::ComboBox keyBox_;
-    juce::ToggleButton keyMajor_{"Major"}, keyLock_{"Lock"}, drums_{"Drums"};
-    std::unique_ptr<ComboAttach> keyA_;
-    std::unique_ptr<ButtonAttach> keyMajorA_, keyLockA_, drumsA_;
+    juce::ComboBox keyBox_, scaleBox_;
+    juce::ToggleButton keyLock_{"Lock"}, drums_{"Drums"};
+    std::unique_ptr<ComboAttach> keyA_, scaleA_;
+    std::unique_ptr<ButtonAttach> keyLockA_, drumsA_;
 
     juce::TextButton relock_{"Re-lock to loop"};
 

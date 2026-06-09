@@ -49,13 +49,16 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     keyBox_.setLookAndFeel(&lnf_);
     addAndMakeVisible(keyBox_);
     keyA_ = std::make_unique<ComboAttach>(proc_.apvts(), "keytonic", keyBox_);
-    for (auto* t : { &keyMajor_, &keyLock_, &drums_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
-    keyMajorA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keymajor", keyMajor_);
-    keyLockA_  = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
-    drumsA_    = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
+    scaleBox_.addItem("Minor", 1); scaleBox_.addItem("Major", 2);  // index 0/1 == param choice
+    scaleBox_.setLookAndFeel(&lnf_);
+    addAndMakeVisible(scaleBox_);
+    scaleA_ = std::make_unique<ComboAttach>(proc_.apvts(), "keymajor", scaleBox_);
+    for (auto* t : { &keyLock_, &drums_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
+    keyLockA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
+    drumsA_   = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
     keyLock_.onStateChange = [this] {
         const bool on = keyLock_.getToggleState();
-        keyBox_.setEnabled(on); keyMajor_.setEnabled(on); repaint();
+        keyBox_.setEnabled(on); scaleBox_.setEnabled(on); repaint();
     };
     keyLock_.onStateChange();
 
@@ -101,11 +104,11 @@ void PluginEditor::resized() {
 
     keyHdr_ = r.removeFromTop(14);             // "KEY"
     auto keyRow = r.removeFromTop(30);
-    keyBox_.setBounds(keyRow.removeFromLeft(70).reduced(0, 3));
-    keyRow.removeFromLeft(12);
-    keyMajor_.setBounds(keyRow.removeFromLeft(86));
-    keyLock_.setBounds(keyRow.removeFromLeft(80));
-    keyRow.removeFromLeft(8);
+    keyBox_.setBounds(keyRow.removeFromLeft(62).reduced(0, 3));
+    keyRow.removeFromLeft(10);
+    scaleBox_.setBounds(keyRow.removeFromLeft(84).reduced(0, 3));
+    keyRow.removeFromLeft(14);
+    keyLock_.setBounds(keyRow.removeFromLeft(70));
     drums_.setBounds(keyRow.removeFromRight(90));
     r.removeFromTop(16);
 
