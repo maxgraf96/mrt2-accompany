@@ -10,6 +10,7 @@
 #include "magenta_paths.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -80,10 +81,15 @@ int main(int argc, char** argv) {
     const int block=512; std::vector<float> rec; rec.reserve((size_t)seconds*48000*2);
     std::vector<float> L(block),R(block);
     double phaseFrames=0; auto t0=std::chrono::steady_clock::now();
+    // LOOP_WRAP=N simulates a host looping an N-frame clip: the playhead PPQ
+    // wraps back to 0 every N musical frames (Ableton Session clip), so set_phase
+    // sees a sawtooth, not a monotonic ramp. This reproduces the live transport.
+    const double loopWrap = std::getenv("LOOP_WRAP") ? std::atof(std::getenv("LOOP_WRAP")) : 0.0;
     int blocks = seconds*48000/block;
     for (int b=0;b<blocks;++b){
         r.apply_params(p);   // mimic the plugin calling this every block
-        r.set_phase((long)phaseFrames); phaseFrames += (double)block/1920.0;  // real frame rate
+        double host = loopWrap > 0 ? std::fmod(phaseFrames, loopWrap) : phaseFrames;
+        r.set_phase((long)host); phaseFrames += (double)block/1920.0;  // real frame rate
         r.read48k(L.data(),R.data(),block);
         for(int i=0;i<block;++i){rec.push_back(L[i]);rec.push_back(R[i]);}
         std::this_thread::sleep_until(t0 + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>((double)(b+1)*block/48000)));

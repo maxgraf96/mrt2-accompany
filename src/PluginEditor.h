@@ -33,8 +33,9 @@ private:
 
     juce::TextEditor prompt_;
 
-    juce::Slider freedom_, follow_, bars_, variation_, dryMix_, outGain_;
-    std::unique_ptr<SliderAttach> freedomA_, followA_, barsA_, variationA_, dryMixA_, outGainA_;
+    juce::Slider freedom_, follow_, cfgStyle_, cfgNotes_, cfgDrums_, bars_, variation_, dryMix_, outGain_;
+    std::unique_ptr<SliderAttach> freedomA_, followA_, cfgStyleA_, cfgNotesA_, cfgDrumsA_,
+                                  barsA_, variationA_, dryMixA_, outGainA_;
 
     juce::ComboBox keyBox_, scaleBox_;
     juce::ToggleButton keyLock_{"Lock"}, drums_{"Drums"};

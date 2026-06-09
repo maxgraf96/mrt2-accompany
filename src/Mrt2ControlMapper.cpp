@@ -7,26 +7,38 @@ namespace mrt2 {
 
 EngineParams resolve_params(const Knobs& k) {
     EngineParams p;
-    // Freedom: low = hug style/prefill (low temp, moderate cfg); high = wander.
-    // Keep cfg_musiccoca in a musical band; temp ~1.0..1.4 (M1 found ~1.2 good).
+    // Freedom: low = hug style/prefill (low temp); high = wander. Freedom also
+    // drives cfg_musiccoca, but via the macro->knob link (applied below), so the
+    // temperature curve is all that's set directly here. (M1 found ~1.2 good.)
     p.temperature   = 1.0f + 0.5f * std::clamp(k.freedom, 0.0f, 1.0f);   // 1.0..1.5
-    p.cfg_musiccoca = 4.5f - 2.0f * std::clamp(k.freedom, 0.0f, 1.0f);   // 4.5..2.5
-    // Follow-input: how strictly the model obeys the chord-MIDI. Maps to both
-    // cfg_notes (in [-1,7]) and unmask_width (silence corridor around chord tones).
+    // Follow-input: how strictly the model obeys the input's chord-MIDI.
     float fh = std::clamp(k.follow_input, 0.0f, 1.0f);
-    // Follow Input trades MUSICAL FLOW vs BASS CONTROL — the two are opposed.
-    // The unmask off-corridor is the lever: NARROW lets the model fill notes
-    // around the chord (flowing piano) but also leaks low end; WIDE forces the
-    // bass off but leaves only bare chord stabs. cfg_notes sets harmonic
-    // strictness. Tuned (diag sweep) so the default (0.4) actually flows:
-    //   low  (0)   -> unmask 4,  cfg_notes 1.0  (loose, melodic, more bass)
-    //   def  (0.4) -> unmask 18, cfg_notes 2.2  (flowing piano, some bass)
-    //   high (1)   -> unmask 40, cfg_notes 4.0  (clean, sparse, bass-suppressed)
-    p.unmask_width  = (int)std::lround(4 + 36 * fh);
-    p.cfg_notes     = 1.0f + 3.0f * fh;
+    // The PRIMARY harmonic-lock lever is cfg_notes (the guidance strength on the
+    // pianoroll conditioning), NOT unmask_width. The upstream reference runs
+    // cfg_notes=5 with unmask_width=0 — strong harmonic anchor while the model
+    // still fills notes freely (flowing piano). Pushing harmony into unmask
+    // instead (a wide forced-OFF corridor) only yields sparse chord stabs AND
+    // weakens the anchor, so we drive cfg_notes hard and keep unmask small (a
+    // gentle bass-avoidance corridor only):
+    //   low  (0)   -> cfg_notes 2.5, unmask 0  (loose, flowing, more bass)
+    //   def  (0.4) -> cfg_notes 4.1, unmask 3  (locked + flowing piano)
+    //   high (1)   -> cfg_notes 6.5, unmask 8  (tightly locked)
+    p.unmask_width  = (int)std::lround(8 * fh);
     p.seed_rotation = k.variation;
     p.drumless      = !k.drums;
     p.onset_mode    = 1;  // exact beat-frame onsets
+
+    // The three CFG scales come from their own knobs (see cfg_*_from_* macros).
+    // If the caller left them unset (bare Knobs{} in tools/tests), derive them
+    // from the macros so behaviour matches the plugin defaults. cfg_drums guides
+    // the drum-control token: 1.0 applies the "off" token at unit strength (can
+    // still leak), so the macro pushes harder (3.0) when the user disables drums.
+    p.cfg_musiccoca = k.cfg_musiccoca > Knobs::kCfgUnset ? k.cfg_musiccoca
+                                                         : cfg_musiccoca_from_freedom(k.freedom);
+    p.cfg_notes     = k.cfg_notes     > Knobs::kCfgUnset ? k.cfg_notes
+                                                         : cfg_notes_from_follow(k.follow_input);
+    p.cfg_drums     = k.cfg_drums     > Knobs::kCfgUnset ? k.cfg_drums
+                                                         : cfg_drums_from_toggle(k.drums);
     return p;
 }
 

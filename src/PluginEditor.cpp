@@ -40,6 +40,9 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     };
     attach(freedom_, "Freedom", "freedom", freedomA_);
     attach(follow_, "Follow", "follow", followA_);
+    attach(cfgStyle_, "CFG Style", "cfgstyle", cfgStyleA_);
+    attach(cfgNotes_, "CFG Notes", "cfgnotes", cfgNotesA_);
+    attach(cfgDrums_, "CFG Drums", "cfgdrums", cfgDrumsA_);
     attach(bars_, "Bars", "bars", barsA_);
     attach(variation_, "Variation", "variation", variationA_);
     attach(dryMix_, "Dry Mix", "drymix", dryMixA_);
@@ -70,7 +73,7 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     };
     addAndMakeVisible(relock_);
 
-    setSize(560, 560);
+    setSize(560, 664);
     startTimerHz(8);
     constructed_ = true;
 }
@@ -100,14 +103,19 @@ void PluginEditor::resized() {
     r.removeFromTop(20);                        // detect line (painted) sits under wave
     r.removeFromTop(16);
 
-    auto knobRow = r.removeFromTop(96);
-    const int kw = knobRow.getWidth() / (int)knobs_.size();
-    for (auto& k : knobs_) {
-        auto cell = knobRow.removeFromLeft(kw);
-        k.cell = cell;
-        k.s->setBounds(cell.reduced(6).withTrimmedTop(16).withTrimmedBottom(16));
+    // 9 knobs across two rows of up to 5 (generative row, then utility row).
+    const int perRow = 5;
+    for (int i = 0; i < (int)knobs_.size(); ) {
+        auto knobRow = r.removeFromTop(92);
+        const int kw = knobRow.getWidth() / perRow;
+        for (int j = 0; j < perRow && i < (int)knobs_.size(); ++j, ++i) {
+            auto cell = knobRow.removeFromLeft(kw);
+            knobs_[(size_t)i].cell = cell;
+            knobs_[(size_t)i].s->setBounds(cell.reduced(6).withTrimmedTop(16).withTrimmedBottom(16));
+        }
+        r.removeFromTop(8);
     }
-    r.removeFromTop(14);
+    r.removeFromTop(8);
 
     keyHdr_ = r.removeFromTop(14);             // "KEY"
     auto keyRow = r.removeFromTop(30);
@@ -239,7 +247,8 @@ void PluginEditor::timerCallback() {
         repaint();
         return;
     }
-    relock_.setButtonText("Re-lock to loop");
+    relock_.setButtonText(proc_.relockPending() ? "Re-lock armed " + ELL + " (next loop)"
+                                                 : "Re-lock to loop");
     relock_.setEnabled(proc_.loadState() == AccompanyRunner::LoadState::Ready);
 
     juce::String line = "Engine: ";

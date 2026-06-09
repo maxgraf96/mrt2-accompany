@@ -19,7 +19,8 @@
 
 namespace mrt2 {
 
-class PluginProcessor : public juce::AudioProcessor {
+class PluginProcessor : public juce::AudioProcessor,
+                        private juce::AudioProcessorValueTreeState::Listener {
 public:
     PluginProcessor();
     ~PluginProcessor() override;
@@ -68,8 +69,12 @@ public:
     }
     void beginDownload();
 
-    // Force a re-capture + re-prefill of the loop now (Re-lock button).
-    void relock() { forceRelock_.store(true); captureReq_.store(true); }
+    // Request a re-capture + re-prefill of the loop. Deferred to the next loop
+    // boundary so the captured window is bar-aligned (avoids rotating the
+    // chord-to-beat mapping vs the host grid). processBlock promotes this to a
+    // forced capture when it next crosses a boundary.
+    void relock() { relockPending_.store(true); }
+    bool relockPending() const { return relockPending_.load(); }
     // Copy the captured-loop waveform peaks for display. Returns the count.
     int  copyWaveform(std::vector<float>& dest) const {
         juce::SpinLock::ScopedLockType lk(waveLock_);
@@ -83,6 +88,9 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout makeParams();
     Knobs knobsFromParams() const;
+    // Macro -> CFG one-way link: Freedom/Follow/Drums write the cfg* knobs.
+    void parameterChanged(const juce::String& id, float value) override;
+    std::atomic<bool> macroWriting_{false};        // reentrancy guard for the link
     HostTransport readTransport(int numSamples);  // playhead -> transport (or synth)
     void ensureLoaded();                            // check assets, load once on first prepareToPlay
     void startEngineLoad();                         // kick the model load + worker
@@ -99,7 +107,8 @@ private:
     std::atomic<bool> uiKeyMajor_{false};
     std::atomic<int> uiLevel_{-1};
     std::atomic<bool> uiLocked_{false};
-    std::atomic<bool> forceRelock_{false};
+    std::atomic<bool> forceRelock_{false};     // boundary -> worker: force re-prefill
+    std::atomic<bool> relockPending_{false};   // Re-lock button: armed, fires at next boundary
     mutable juce::SpinLock waveLock_;
     std::vector<float> wavePeaks_;   // captured-loop waveform peaks (worker-set)
 

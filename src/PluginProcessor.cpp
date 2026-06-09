@@ -25,6 +25,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<P>(juce::ParameterID{"freedom", 1}, "Freedom", R{0.f, 1.f}, 0.35f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"follow", 1}, "Follow Input", R{0.f, 1.f}, 0.4f));
     p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"drums", 1}, "Drums", false));
+    // The three CFG (classifier-free guidance) scales as direct knobs. Freedom/
+    // Follow/Drums are macros that write into these one-way (see ctor listener),
+    // so defaults match the macro mappings for the default macro positions.
+    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgstyle", 1}, "CFG Style", R{0.f, 8.f},
+                                    cfg_musiccoca_from_freedom(0.35f)));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgnotes", 1}, "CFG Notes", R{-1.f, 7.f},
+                                    cfg_notes_from_follow(0.4f)));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgdrums", 1}, "CFG Drums", R{0.f, 8.f},
+                                    cfg_drums_from_toggle(false)));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"variation", 1}, "Variation", 0, 15, 0));
     p.push_back(std::make_unique<P>(juce::ParameterID{"drymix", 1}, "Dry Mix", R{0.f, 1.f}, 0.0f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"outgain", 1}, "Output Gain", R{-24.f, 12.f}, 0.0f));
@@ -47,11 +56,34 @@ PluginProcessor::PluginProcessor()
     // host plugin scans (and JUCE's manifest helper) don't load 2.6 GB and abort
     // on teardown. The heavy load is kicked off from the first prepareToPlay.
     runner_.set_prompt(prompt_.toStdString());  // queue default style for when we load
+    // Macro -> CFG link: moving Freedom/Follow/Drums rewrites the cfg* knobs
+    // (one-way; editing a cfg knob does NOT move the macros).
+    apvts_.addParameterListener("freedom", this);
+    apvts_.addParameterListener("follow", this);
+    apvts_.addParameterListener("drums", this);
 }
 
 PluginProcessor::~PluginProcessor() {
+    apvts_.removeParameterListener("freedom", this);
+    apvts_.removeParameterListener("follow", this);
+    apvts_.removeParameterListener("drums", this);
     workerRun_.store(false);
     if (worker_.joinable()) worker_.join();
+}
+
+// One-way macro -> CFG link. Moving Freedom/Follow/Drums rewrites the matching
+// cfg* knob; editing a cfg knob directly does nothing here (we don't listen to
+// them), so manual CFG tweaks are preserved until the next macro move.
+void PluginProcessor::parameterChanged(const juce::String& id, float value) {
+    if (macroWriting_.exchange(true)) return;   // ignore the writes we trigger below
+    auto setCfg = [this](const char* pid, float v) {
+        if (auto* pf = dynamic_cast<juce::AudioParameterFloat*>(apvts_.getParameter(pid)))
+            *pf = v;   // denormalized set + host notify
+    };
+    if (id == "freedom")     setCfg("cfgstyle", cfg_musiccoca_from_freedom(value));
+    else if (id == "follow") setCfg("cfgnotes", cfg_notes_from_follow(value));
+    else if (id == "drums")  setCfg("cfgdrums", cfg_drums_from_toggle(value > 0.5f));
+    macroWriting_.store(false);
 }
 
 void PluginProcessor::ensureLoaded() {
@@ -186,6 +218,9 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
         const bool boundary = (loopIndex != prevLoopIndex_) || grid.wrapped || grid.started;
         if (boundary) {
             captureReq_.store(true);                 // worker: capture -> analyze -> (maybe) prefill
+            // A pending Re-lock fires here, bar-aligned: force the re-prefill even
+            // if the loop is unchanged. The capture window now ends on the boundary.
+            if (relockPending_.exchange(false)) forceRelock_.store(true);
             if (grid.wrapped || grid.started) runner_.reanchor();  // drain ring at the seam
         }
         prevLoopIndex_ = loopIndex;
@@ -251,6 +286,9 @@ Knobs PluginProcessor::knobsFromParams() const {
     k.follow_input = apvts_.getRawParameterValue("follow")->load();
     k.drums = apvts_.getRawParameterValue("drums")->load() > 0.5f;
     k.variation = (int)apvts_.getRawParameterValue("variation")->load();
+    k.cfg_musiccoca = apvts_.getRawParameterValue("cfgstyle")->load();
+    k.cfg_notes     = apvts_.getRawParameterValue("cfgnotes")->load();
+    k.cfg_drums     = apvts_.getRawParameterValue("cfgdrums")->load();
     k.user_key_tonic = (int)apvts_.getRawParameterValue("keytonic")->load();
     k.user_key_mode = apvts_.getRawParameterValue("keymajor")->load() > 0.5f ? Mode::Major : Mode::Minor;
     return k;  // register_lo/hi stay -1 (occupancy-aware auto)

@@ -92,8 +92,15 @@ void AccompanyRunner::inference_loop() {
             const long target = gen_count_.load(std::memory_order_relaxed)
                               + phase_adjust_.load(std::memory_order_relaxed);
             if (last_emitted_ < 0) last_emitted_ = target - 1;
+            // `target` tracks the host playhead (set_phase), so when the host
+            // LOOPS a clip its PPQ wraps backward and `target` drops by ~a loop.
+            // A pure forward-only sweep would then emit nothing until gen_count
+            // climbed back past the old peak — i.e. onsets freeze after the first
+            // loop and the model coasts to silence. So on any backward jump or a
+            // jump bigger than one loop, resync: emit just the new target frame.
+            const long delta = target - last_emitted_;
+            if (delta <= 0 || delta > fpl) last_emitted_ = target - 1;  // wrap / seek / big jump
             long from = last_emitted_;
-            if (target - from > fpl) from = target - fpl;   // cap a big jump at one loop
             for (long f = from + 1; f <= target; ++f) {
                 const long lf = ((f % fpl) + fpl) % fpl;
                 for (const auto& e : plan->by_frame[(std::size_t)lf])

@@ -19,6 +19,7 @@
 
 #pragma once
 #include "KeyChordAnalyzer.h"
+#include <algorithm>
 #include <array>
 #include <utility>
 #include <vector>
@@ -48,7 +49,25 @@ struct Knobs {
     // (HarmonyLevel::None). Also the lock target when the user locks the key.
     int   user_key_tonic = 9;     // pitch class, default A
     Mode  user_key_mode = Mode::Minor;
+    // Direct CFG overrides. The three CFG scales are exposed as their own knobs;
+    // Freedom/Follow/Drums are macros that write into them (one-way). When set
+    // (>= kCfgUnset) resolve_params uses these verbatim; otherwise it derives
+    // them from the macros (keeps tools/tests that build a bare Knobs{} working).
+    static constexpr float kCfgUnset = -1000.0f;
+    float cfg_musiccoca = kCfgUnset;
+    float cfg_notes     = kCfgUnset;
+    float cfg_drums     = kCfgUnset;
 };
+
+// Macro -> CFG mappings. Shared by resolve_params and the plugin's macro
+// listener so the knob values and the engine values never disagree.
+inline float cfg_musiccoca_from_freedom(float freedom) {
+    return std::clamp(4.5f - 2.0f * std::clamp(freedom, 0.0f, 1.0f), 0.0f, 8.0f);
+}
+inline float cfg_notes_from_follow(float follow) {
+    return std::clamp(2.5f + 4.0f * std::clamp(follow, 0.0f, 1.0f), -1.0f, 7.0f);
+}
+inline float cfg_drums_from_toggle(bool drums) { return drums ? 1.0f : 3.0f; }
 
 // Resolved engine parameters for one configuration (the §6 table).
 struct EngineParams {
