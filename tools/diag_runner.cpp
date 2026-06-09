@@ -40,9 +40,11 @@ int main(int argc, char** argv) {
     if (r.state()!=AccompanyRunner::LoadState::Ready){std::fprintf(stderr,"not ready\n");return 1;}
 
     int unmask = std::getenv("UNMASK") ? std::atoi(std::getenv("UNMASK")) : 20;
-    EngineParams p; p.temperature=1.17f; p.top_k=40; p.cfg_musiccoca=3.8f; p.cfg_notes=3.8f;
-    p.cfg_drums=1.0f; p.unmask_width=unmask; p.seed_rotation=0; p.drumless=true; p.onset_mode=1;
-    std::printf("[diag] unmask_width=%d\n", unmask);
+    int onset = std::getenv("ONSET_MODE") ? std::atoi(std::getenv("ONSET_MODE")) : 1;
+    float cfgn = std::getenv("CFG_NOTES") ? (float)std::atof(std::getenv("CFG_NOTES")) : 3.8f;
+    EngineParams p; p.temperature=1.17f; p.top_k=40; p.cfg_musiccoca=3.8f; p.cfg_notes=cfgn;
+    p.cfg_drums=1.0f; p.unmask_width=unmask; p.seed_rotation=0; p.drumless=true; p.onset_mode=onset;
+    std::printf("[diag] unmask=%d onset_mode=%d cfg_notes=%.1f\n", unmask, onset, cfgn);
     r.apply_params(p);
     r.set_prompt("jazz piano");
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

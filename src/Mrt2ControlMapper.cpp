@@ -14,13 +14,16 @@ EngineParams resolve_params(const Knobs& k) {
     // Follow-input: how strictly the model obeys the chord-MIDI. Maps to both
     // cfg_notes (in [-1,7]) and unmask_width (silence corridor around chord tones).
     float fh = std::clamp(k.follow_input, 0.0f, 1.0f);
-    p.cfg_notes     = 0.5f + 5.5f * fh;                                  // 0.5..6.0
-    // Wide off-corridor: in long (minutes) generation the model's KV cache
-    // accumulates low end and drifts back toward the bass-prefill bias; the
-    // off-corridor around the conditioned (mid-register) chord tones must reach
-    // down past the bass to keep forcing it OFF. 45 measured best over 90 s
-    // (6% vs 31% at 20; 127/full-mask over-constrains back to 13%).
-    p.unmask_width  = (int)std::lround(12 + 56 * fh);                    // 12..68 semitones
+    // Follow Input trades MUSICAL FLOW vs BASS CONTROL — the two are opposed.
+    // The unmask off-corridor is the lever: NARROW lets the model fill notes
+    // around the chord (flowing piano) but also leaks low end; WIDE forces the
+    // bass off but leaves only bare chord stabs. cfg_notes sets harmonic
+    // strictness. Tuned (diag sweep) so the default (0.4) actually flows:
+    //   low  (0)   -> unmask 4,  cfg_notes 1.0  (loose, melodic, more bass)
+    //   def  (0.4) -> unmask 18, cfg_notes 2.2  (flowing piano, some bass)
+    //   high (1)   -> unmask 40, cfg_notes 4.0  (clean, sparse, bass-suppressed)
+    p.unmask_width  = (int)std::lround(4 + 36 * fh);
+    p.cfg_notes     = 1.0f + 3.0f * fh;
     p.seed_rotation = k.variation;
     p.drumless      = !k.drums;
     p.onset_mode    = 1;  // exact beat-frame onsets
