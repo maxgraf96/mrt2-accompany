@@ -58,6 +58,14 @@ public:
     int   uiLevel() const { return uiLevel_.load(); }          // HarmonyLevel; -1 none
     bool  uiLocked() const { return uiLocked_.load(); }
 
+    // Force a re-capture + re-prefill of the loop now (Re-lock button).
+    void relock() { forceRelock_.store(true); captureReq_.store(true); }
+    // Copy the captured-loop waveform peaks for display. Returns the count.
+    int  copyWaveform(std::vector<float>& dest) const {
+        juce::SpinLock::ScopedLockType lk(waveLock_);
+        dest = wavePeaks_; return (int)dest.size();
+    }
+
     // Editor sets the style prompt (message thread).
     void setPrompt(const juce::String& p);
     juce::String getPrompt() const;
@@ -76,6 +84,9 @@ private:
     std::atomic<bool> uiKeyMajor_{false};
     std::atomic<int> uiLevel_{-1};
     std::atomic<bool> uiLocked_{false};
+    std::atomic<bool> forceRelock_{false};
+    mutable juce::SpinLock waveLock_;
+    std::vector<float> wavePeaks_;   // captured-loop waveform peaks (worker-set)
 
     AccompanyRunner runner_;
     juce::AudioProcessorValueTreeState apvts_;

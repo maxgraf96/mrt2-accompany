@@ -1,8 +1,8 @@
-// M4a editor — minimal functional UI (full WebView UI is M6): prompt field,
-// the core knobs, and a model-load / status line.
+// MRT2-Accompany editor — dark, monochrome, sectioned layout (see MrtLookAndFeel).
 
 #pragma once
 #include "PluginProcessor.h"
+#include "MrtLookAndFeel.h"
 #include <juce_audio_processors/juce_audio_processors.h>
 
 namespace mrt2 {
@@ -17,33 +17,34 @@ public:
 
 private:
     void timerCallback() override;
+    void styleKnob(juce::Slider&);
 
     using SliderAttach = juce::AudioProcessorValueTreeState::SliderAttachment;
     using ButtonAttach = juce::AudioProcessorValueTreeState::ButtonAttachment;
+    using ComboAttach  = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
 
     PluginProcessor& proc_;
+    MrtLookAndFeel lnf_;
 
-    juce::Label title_;
-    juce::Label promptLabel_;
     juce::TextEditor prompt_;
 
-    juce::Slider freedom_, follow_, dryMix_, outGain_, variation_, bars_;
-    juce::Label freedomL_, followL_, dryMixL_, outGainL_, variationL_, barsL_;
-    juce::ToggleButton drums_{"Drums"};
+    juce::Slider freedom_, follow_, bars_, variation_, dryMix_, outGain_;
+    std::unique_ptr<SliderAttach> freedomA_, followA_, barsA_, variationA_, dryMixA_, outGainA_;
 
-    std::unique_ptr<SliderAttach> freedomA_, followA_, dryMixA_, outGainA_, variationA_, barsA_;
-    std::unique_ptr<ButtonAttach> drumsA_;
-
-    // Key override: Lock + tonic + major/minor.
-    juce::Label keyLabel_;
     juce::ComboBox keyBox_;
-    juce::ToggleButton keyMajor_{"Major"}, keyLock_{"Lock Key"};
-    using ComboAttach = juce::AudioProcessorValueTreeState::ComboBoxAttachment;
+    juce::ToggleButton keyMajor_{"Major"}, keyLock_{"Lock"}, drums_{"Drums"};
     std::unique_ptr<ComboAttach> keyA_;
-    std::unique_ptr<ButtonAttach> keyMajorA_, keyLockA_;
+    std::unique_ptr<ButtonAttach> keyMajorA_, keyLockA_, drumsA_;
 
-    juce::Label status_;     // engine/perf
-    juce::Label transport_;  // host BPM / bars / detected key / lock
+    juce::TextButton relock_{"Re-lock to loop"};
+
+    std::vector<float> wave_;    // cached captured-loop peaks for paint()
+    juce::String statusLine_, detectLine_;
+
+    // Knob geometry filled by resized(), used by paint() for labels/values.
+    struct KnobInfo { juce::Slider* s; juce::String name; juce::Rectangle<int> cell; };
+    std::vector<KnobInfo> knobs_;
+    juce::Rectangle<int> waveBounds_, promptHdr_, keyHdr_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PluginEditor)
 };

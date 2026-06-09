@@ -96,6 +96,10 @@ void PluginProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
 // running one (Standalone: BPM param, always-playing) when none is available.
 HostTransport PluginProcessor::readTransport(int numSamples) {
     HostTransport t;
+    // Standalone has no musical transport (its playhead reports not-playing),
+    // so run free: BPM param + always playing. Real hosts use the playhead.
+    const bool standalone = wrapperType == wrapperType_Standalone;
+    if (!standalone)
     if (auto* ph = getPlayHead()) {
         if (auto pos = ph->getPosition()) {
             t.valid = true;
@@ -236,10 +240,24 @@ void PluginProcessor::workerLoop() {
     while (workerRun_.load()) {
         if (!captureReq_.exchange(false)) { std::this_thread::sleep_for(20ms); continue; }
         if (!runner_.ready()) continue;
+        const bool force = forceRelock_.exchange(false);   // Re-lock button: always re-prefill
 
         CapturedLoop c;
         if (!capture_.snapshot(c)) continue;
-        if (!capture_.is_change(c)) continue;   // unchanged loop -> keep evolving, no re-prefill
+        if (!force && !capture_.is_change(c)) continue;   // unchanged loop -> keep evolving
+
+        // Captured-loop waveform peaks for the editor (downsample mono -> ~256).
+        {
+            const int nb = 256, n = c.frames48k;
+            std::vector<float> peaks(nb, 0.0f);
+            if (n > 0) for (int i = 0; i < nb; ++i) {
+                int s0 = (int)((long long)i * n / nb), s1 = (int)((long long)(i + 1) * n / nb);
+                float m = 0; for (int s = s0; s < s1 && s < n; ++s) m = std::max(m, std::abs(c.mono48k[(size_t)s]));
+                peaks[(size_t)i] = m;
+            }
+            juce::SpinLock::ScopedLockType lk(waveLock_);
+            wavePeaks_.swap(peaks);
+        }
 
         const double bpm = curBpm_.load();
         const int beatsPerBar = curBeatsPerBar_.load();

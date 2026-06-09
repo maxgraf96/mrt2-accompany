@@ -2,135 +2,207 @@
 
 namespace mrt2 {
 
-static void styleKnob(juce::Slider& s) {
+static const char* kPc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+
+void PluginEditor::styleKnob(juce::Slider& s) {
     s.setSliderStyle(juce::Slider::RotaryHorizontalVerticalDrag);
-    s.setTextBoxStyle(juce::Slider::TextBoxBelow, false, 64, 18);
+    s.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
+    s.setLookAndFeel(&lnf_);
+    addAndMakeVisible(s);
 }
 
 PluginEditor::PluginEditor(PluginProcessor& p)
     : juce::AudioProcessorEditor(p), proc_(p) {
-    title_.setText("MRT2-Accompany", juce::dontSendNotification);
-    title_.setFont(juce::Font(juce::FontOptions(20.0f, juce::Font::bold)));
-    addAndMakeVisible(title_);
+    setLookAndFeel(&lnf_);
 
-    promptLabel_.setText("Style prompt", juce::dontSendNotification);
-    addAndMakeVisible(promptLabel_);
     prompt_.setText(proc_.getPrompt(), juce::dontSendNotification);
     prompt_.setMultiLine(false);
+    prompt_.setFont(ui::font(15.0f));
+    prompt_.setIndents(10, 6);
+    prompt_.setJustification(juce::Justification::centredLeft);
     prompt_.onReturnKey = [this] { proc_.setPrompt(prompt_.getText()); };
     prompt_.onFocusLost = [this] { proc_.setPrompt(prompt_.getText()); };
+    prompt_.setLookAndFeel(&lnf_);
     addAndMakeVisible(prompt_);
 
-    auto setupKnob = [this](juce::Slider& s, juce::Label& l, const juce::String& name,
-                            const juce::String& pid, std::unique_ptr<SliderAttach>& a) {
+    auto attach = [this](juce::Slider& s, const juce::String& name, const juce::String& pid,
+                         std::unique_ptr<SliderAttach>& a) {
         styleKnob(s);
-        addAndMakeVisible(s);
-        l.setText(name, juce::dontSendNotification);
-        l.setJustificationType(juce::Justification::centred);
-        addAndMakeVisible(l);
         a = std::make_unique<SliderAttach>(proc_.apvts(), pid, s);
+        knobs_.push_back({&s, name, {}});
     };
-    setupKnob(freedom_, freedomL_, "Freedom", "freedom", freedomA_);
-    setupKnob(follow_, followL_, "Follow Input", "follow", followA_);
-    setupKnob(bars_, barsL_, "Loop Bars", "bars", barsA_);
-    setupKnob(variation_, variationL_, "Variation", "variation", variationA_);
-    setupKnob(dryMix_, dryMixL_, "Dry Mix", "drymix", dryMixA_);
-    setupKnob(outGain_, outGainL_, "Out Gain", "outgain", outGainA_);
+    attach(freedom_, "Freedom", "freedom", freedomA_);
+    attach(follow_, "Follow", "follow", followA_);
+    attach(bars_, "Bars", "bars", barsA_);
+    attach(variation_, "Variation", "variation", variationA_);
+    attach(dryMix_, "Dry Mix", "drymix", dryMixA_);
+    attach(outGain_, "Out Gain", "outgain", outGainA_);
 
-    addAndMakeVisible(drums_);
-    drumsA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
-
-    // Key override controls.
-    keyLabel_.setText("Key", juce::dontSendNotification);
-    addAndMakeVisible(keyLabel_);
-    static const char* kPc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-    for (int i = 0; i < 12; ++i) keyBox_.addItem(kPc[i], i + 1);  // ids 1..12
+    for (int i = 0; i < 12; ++i) keyBox_.addItem(kPc[i], i + 1);
+    keyBox_.setLookAndFeel(&lnf_);
     addAndMakeVisible(keyBox_);
     keyA_ = std::make_unique<ComboAttach>(proc_.apvts(), "keytonic", keyBox_);
-    addAndMakeVisible(keyMajor_);
+    for (auto* t : { &keyMajor_, &keyLock_, &drums_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
     keyMajorA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keymajor", keyMajor_);
-    addAndMakeVisible(keyLock_);
-    keyLockA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
+    keyLockA_  = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
+    drumsA_    = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
     keyLock_.onStateChange = [this] {
-        const bool on = keyLock_.getToggleState();   // grey out tonic/major when Auto
-        keyBox_.setEnabled(on); keyMajor_.setEnabled(on);
+        const bool on = keyLock_.getToggleState();
+        keyBox_.setEnabled(on); keyMajor_.setEnabled(on); repaint();
     };
     keyLock_.onStateChange();
 
-    transport_.setJustificationType(juce::Justification::centredLeft);
-    addAndMakeVisible(transport_);
-    status_.setJustificationType(juce::Justification::centredLeft);
-    addAndMakeVisible(status_);
+    relock_.setLookAndFeel(&lnf_);
+    relock_.onClick = [this] { proc_.relock(); };
+    addAndMakeVisible(relock_);
 
-    setSize(620, 340);
-    startTimerHz(5);
+    setSize(560, 560);
+    startTimerHz(8);
 }
 
-PluginEditor::~PluginEditor() = default;
-
-void PluginEditor::paint(juce::Graphics& g) {
-    g.fillAll(juce::Colour(0xff1c1c20));
+PluginEditor::~PluginEditor() {
+    setLookAndFeel(nullptr);
+    for (auto& k : knobs_) k.s->setLookAndFeel(nullptr);
 }
 
 void PluginEditor::resized() {
-    auto r = getLocalBounds().reduced(16);
-    title_.setBounds(r.removeFromTop(28));
-    auto promptRow = r.removeFromTop(56);
-    promptLabel_.setBounds(promptRow.removeFromTop(18));
-    prompt_.setBounds(promptRow.removeFromTop(28));
-    r.removeFromTop(8);
+    auto r = getLocalBounds().reduced(22);
+    r.removeFromTop(40);                       // header (painted)
+    r.removeFromTop(14);
+    promptHdr_ = r.removeFromTop(14);          // "STYLE PROMPT"
+    prompt_.setBounds(r.removeFromTop(34));
+    r.removeFromTop(18);
 
-    auto knobRow = r.removeFromTop(110);
-    const int kw = knobRow.getWidth() / 6;
-    auto place = [&](juce::Slider& s, juce::Label& l) {
+    waveBounds_ = r.removeFromTop(70);         // captured-loop waveform
+    r.removeFromTop(20);                        // detect line (painted) sits under wave
+    r.removeFromTop(16);
+
+    auto knobRow = r.removeFromTop(96);
+    const int kw = knobRow.getWidth() / (int)knobs_.size();
+    for (auto& k : knobs_) {
         auto cell = knobRow.removeFromLeft(kw);
-        l.setBounds(cell.removeFromTop(16));
-        s.setBounds(cell);
-    };
-    place(freedom_, freedomL_); place(follow_, followL_); place(bars_, barsL_);
-    place(variation_, variationL_); place(dryMix_, dryMixL_); place(outGain_, outGainL_);
+        k.cell = cell;
+        k.s->setBounds(cell.reduced(6).withTrimmedTop(16).withTrimmedBottom(16));
+    }
+    r.removeFromTop(14);
 
-    r.removeFromTop(8);
-    auto ctlRow = r.removeFromTop(26);
-    drums_.setBounds(ctlRow.removeFromLeft(80));
-    ctlRow.removeFromLeft(16);
-    keyLabel_.setBounds(ctlRow.removeFromLeft(32));
-    keyBox_.setBounds(ctlRow.removeFromLeft(64).reduced(0, 2));
-    ctlRow.removeFromLeft(8);
-    keyMajor_.setBounds(ctlRow.removeFromLeft(80));
-    keyLock_.setBounds(ctlRow.removeFromLeft(100));
-    r.removeFromTop(6);
-    transport_.setBounds(r.removeFromTop(22));
-    status_.setBounds(r.removeFromTop(22));
+    keyHdr_ = r.removeFromTop(14);             // "KEY"
+    auto keyRow = r.removeFromTop(30);
+    keyBox_.setBounds(keyRow.removeFromLeft(70).reduced(0, 3));
+    keyRow.removeFromLeft(12);
+    keyMajor_.setBounds(keyRow.removeFromLeft(86));
+    keyLock_.setBounds(keyRow.removeFromLeft(80));
+    keyRow.removeFromLeft(8);
+    drums_.setBounds(keyRow.removeFromRight(90));
+    r.removeFromTop(16);
+
+    relock_.setBounds(r.removeFromTop(42));
+}
+
+static void sectionLabel(juce::Graphics& g, juce::Rectangle<int> b, const juce::String& t) {
+    g.setColour(ui::muted);
+    g.setFont(ui::font(11.0f, true));
+    g.drawText(t.toUpperCase(), b, juce::Justification::centredLeft, false);
+}
+
+void PluginEditor::paint(juce::Graphics& g) {
+    g.setGradientFill({ui::bg0, 0, 0, ui::bg1, 0, (float)getHeight(), false});
+    g.fillAll();
+
+    auto full = getLocalBounds().reduced(22);
+    // Header: title + status dot.
+    auto hdr = full.removeFromTop(40);
+    g.setColour(ui::text); g.setFont(ui::font(24.0f, true));
+    g.drawText("MRT2", hdr.removeFromLeft(72), juce::Justification::centredLeft, false);
+    g.setColour(ui::muted); g.setFont(ui::font(17.0f));
+    g.drawText("Accompany", hdr.removeFromLeft(120).withY(hdr.getY() + 3), juce::Justification::centredLeft, false);
+
+    juce::Colour dot = ui::muted; juce::String st = "idle";
+    switch (proc_.loadState()) {
+        case AccompanyRunner::LoadState::Loading: dot = ui::warn; st = "loading model"; break;
+        case AccompanyRunner::LoadState::Ready:   dot = ui::ok;   st = "ready"; break;
+        case AccompanyRunner::LoadState::Failed:  dot = ui::err;  st = "load failed"; break;
+        default: break;
+    }
+    auto sb = hdr.removeFromRight(150);
+    g.setColour(ui::muted); g.setFont(ui::font(13.0f));
+    g.drawText(st, sb.withTrimmedRight(16), juce::Justification::centredRight, false);
+    g.setColour(dot); g.fillEllipse(juce::Rectangle<float>(8, 8).withCentre({(float)sb.getRight() - 5, (float)sb.getCentreY()}));
+
+    auto line = [&](int y) { g.setColour(ui::divider); g.fillRect(full.getX(), y, full.getWidth(), 1); };
+    line(promptHdr_.getY() - 8);
+    sectionLabel(g, promptHdr_, "Style prompt");
+
+    // Waveform panel.
+    line(waveBounds_.getY() - 8);
+    auto wb = waveBounds_.toFloat();
+    g.setColour(ui::panel); g.fillRoundedRectangle(wb, 6.0f);
+    if (!wave_.empty()) {
+        const float mid = wb.getCentreY(), hh = wb.getHeight() * 0.42f;
+        const float step = wb.getWidth() / (float)wave_.size();
+        g.setColour(ui::muted.withAlpha(0.85f));
+        for (size_t i = 0; i < wave_.size(); ++i) {
+            float a = juce::jlimit(0.0f, 1.0f, wave_[i]) * hh;
+            float x = wb.getX() + i * step;
+            g.fillRect(juce::Rectangle<float>(x, mid - a, juce::jmax(1.0f, step - 1.0f), a * 2));
+        }
+    } else {
+        g.setColour(ui::faint); g.setFont(ui::font(13.0f));
+        g.drawText(proc_.uiPlaying() ? "listening for a loop…" : "play your loop to capture",
+                   waveBounds_, juce::Justification::centred, false);
+    }
+    g.setColour(ui::muted); g.setFont(ui::font(12.5f));
+    g.drawText(detectLine_, juce::Rectangle<int>(waveBounds_.getX(), waveBounds_.getBottom() + 4,
+               waveBounds_.getWidth(), 18), juce::Justification::centredLeft, false);
+
+    // Knob labels + values (work on a copy — k.cell is persistent layout state).
+    for (auto& k : knobs_) {
+        auto cell = k.cell;
+        g.setColour(ui::muted); g.setFont(ui::font(11.5f));
+        g.drawText(k.name, cell.removeFromTop(15).expanded(6, 0), juce::Justification::centred, false);
+        g.setColour(ui::text); g.setFont(ui::font(12.0f, true));
+        juce::String v = (k.name == "Bars" || k.name == "Variation")
+            ? juce::String((int)k.s->getValue())
+            : juce::String(k.s->getValue(), 2);
+        g.drawText(v, cell.removeFromBottom(15), juce::Justification::centred, false);
+    }
+
+    line(keyHdr_.getY() - 8);
+    sectionLabel(g, keyHdr_, "Key  ·  override");
+
+    g.setColour(ui::muted); g.setFont(ui::font(12.0f));
+    g.drawText(statusLine_, juce::Rectangle<int>(full.getX(), relock_.getBottom() + 8,
+               full.getWidth(), 18), juce::Justification::centredLeft, false);
 }
 
 void PluginEditor::timerCallback() {
-    const char* s = "…";
-    switch (proc_.loadState()) {
-        case AccompanyRunner::LoadState::Idle:    s = "idle"; break;
-        case AccompanyRunner::LoadState::Loading: s = "loading model…"; break;
-        case AccompanyRunner::LoadState::Ready:   s = "ready — streaming"; break;
-        case AccompanyRunner::LoadState::Failed:  s = "model load FAILED (check assets)"; break;
-    }
-    juce::String line = juce::String("Engine: ") + s;
-    if (proc_.loadState() == AccompanyRunner::LoadState::Ready)
-        line << "   buf " << (int)(proc_.runner().ring_available() / 1920)
-             << "   " << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame"
-             << "   drops " << (int)proc_.runner().dropped();
-    status_.setText(line, juce::dontSendNotification);
+    int n = proc_.copyWaveform(wave_);
+    juce::ignoreUnused(n);
 
-    // Transport / detection readout: what the plugin actually receives + found.
-    static const char* kPc[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-    const int bars = (int)proc_.apvts().getRawParameterValue("bars")->load();
-    juce::String t;
-    t << "Host: " << juce::String(proc_.uiBpm(), 1) << " BPM  "
-      << (proc_.uiPlaying() ? "playing" : "stopped") << "   Bars " << bars;
-    if (proc_.uiKeyTonic() >= 0) {
-        const char* lvl = proc_.uiLevel() == 0 ? "chords" : proc_.uiLevel() == 1 ? "key-scale" : "atonal";
-        t << "   Key " << kPc[proc_.uiKeyTonic() % 12] << (proc_.uiKeyMajor() ? "" : "m")
-          << " (" << lvl << ")   " << (proc_.uiLocked() ? "LOCKED" : "listening…");
+    juce::String line = "Engine: ";
+    switch (proc_.loadState()) {
+        case AccompanyRunner::LoadState::Loading: line << "loading model…"; break;
+        case AccompanyRunner::LoadState::Ready:
+            line << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame · buf "
+                 << (int)(proc_.runner().ring_available() / 1920) << " · drops "
+                 << (int)proc_.runner().dropped(); break;
+        case AccompanyRunner::LoadState::Failed: line << "load FAILED (check assets)"; break;
+        default: line << "idle"; break;
     }
-    transport_.setText(t, juce::dontSendNotification);
+    statusLine_ = line;
+
+    const int bars = (int)proc_.apvts().getRawParameterValue("bars")->load();
+    juce::String d;
+    d << juce::String(proc_.uiBpm(), 1) << " BPM   " << bars << " bars   ";
+    if (proc_.uiKeyTonic() >= 0) {
+        const char* lv = proc_.uiLevel() == 0 ? "chords" : proc_.uiLevel() == 1 ? "key-scale" : "atonal";
+        d << kPc[proc_.uiKeyTonic() % 12] << (proc_.uiKeyMajor() ? " maj" : " min")
+          << " · " << lv << "   " << (proc_.uiLocked() ? "● LOCKED" : "○ listening…");
+    } else {
+        d << (proc_.uiPlaying() ? "listening…" : "stopped");
+    }
+    detectLine_ = d;
+    repaint();
 }
 
 }  // namespace mrt2
