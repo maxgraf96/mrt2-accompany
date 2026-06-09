@@ -53,7 +53,13 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     keyLock_.onStateChange();
 
     relock_.setLookAndFeel(&lnf_);
-    relock_.onClick = [this] { proc_.relock(); };
+    relock_.onClick = [this] {
+        auto s = proc_.assetState();
+        if (s == PluginProcessor::AssetState::NeedsDownload || s == PluginProcessor::AssetState::Failed)
+            proc_.beginDownload();
+        else
+            proc_.relock();
+    };
     addAndMakeVisible(relock_);
 
     setSize(560, 560);
@@ -137,7 +143,22 @@ void PluginEditor::paint(juce::Graphics& g) {
     line(waveBounds_.getY() - 8);
     auto wb = waveBounds_.toFloat();
     g.setColour(ui::panel); g.fillRoundedRectangle(wb, 6.0f);
-    if (!wave_.empty()) {
+    using AS = PluginProcessor::AssetState;
+    const AS as = proc_.assetState();
+    if (as == AS::NeedsDownload || as == AS::Downloading || as == AS::Failed) {
+        auto bar = wb.reduced(20.0f).withHeight(6.0f).withY(wb.getCentreY() - 3.0f);
+        g.setColour(ui::track); g.fillRoundedRectangle(bar, 3.0f);
+        if (as == AS::Downloading) {
+            g.setColour(ui::accent);
+            g.fillRoundedRectangle(bar.withWidth(bar.getWidth() * juce::jlimit(0.0f, 1.0f, proc_.downloadProgress())), 3.0f);
+        }
+        g.setColour(ui::muted); g.setFont(ui::font(12.5f));
+        g.drawText(as == AS::Downloading ? "downloading model…"
+                   : as == AS::Failed ? "download failed"
+                   : "click the button below to download",
+                   wb.withTrimmedBottom(wb.getHeight() - 22.0f).toNearestInt(),
+                   juce::Justification::centred, false);
+    } else if (!wave_.empty()) {
         const float mid = wb.getCentreY(), hh = wb.getHeight() * 0.42f;
         const float step = wb.getWidth() / (float)wave_.size();
         g.setColour(ui::muted.withAlpha(0.85f));
@@ -178,6 +199,31 @@ void PluginEditor::paint(juce::Graphics& g) {
 void PluginEditor::timerCallback() {
     int n = proc_.copyWaveform(wave_);
     juce::ignoreUnused(n);
+
+    // Asset-download flow takes over the button + readout until the model is local.
+    using AS = PluginProcessor::AssetState;
+    const AS as = proc_.assetState();
+    if (as == AS::NeedsDownload || as == AS::Downloading || as == AS::Failed) {
+        const int pct = (int)std::round(proc_.downloadProgress() * 100.0f);
+        if (as == AS::NeedsDownload) {
+            relock_.setButtonText("Download MRT2 model  (~3 GB, one time)");
+            relock_.setEnabled(true);
+            detectLine_ = "Model not found locally — a one-time download is required.";
+        } else if (as == AS::Downloading) {
+            relock_.setButtonText("Downloading…  " + juce::String(pct) + "%");
+            relock_.setEnabled(false);
+            detectLine_ = proc_.downloadStatus();
+        } else {
+            relock_.setButtonText("Download failed — retry");
+            relock_.setEnabled(true);
+            detectLine_ = "Download failed. Check your connection and retry.";
+        }
+        statusLine_ = "Engine: waiting for model assets";
+        repaint();
+        return;
+    }
+    relock_.setButtonText("Re-lock to loop");
+    relock_.setEnabled(proc_.loadState() == AccompanyRunner::LoadState::Ready);
 
     juce::String line = "Engine: ";
     switch (proc_.loadState()) {

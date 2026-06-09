@@ -55,11 +55,35 @@ PluginProcessor::~PluginProcessor() {
 
 void PluginProcessor::ensureLoaded() {
     if (loadStarted_.exchange(true)) return;  // once
+    if (AssetManager::assets_ready()) {
+        assetState_.store(AssetState::Ready);
+        startEngineLoad();
+    } else {
+        assetState_.store(AssetState::NeedsDownload);  // editor offers the download
+    }
+}
+
+void PluginProcessor::startEngineLoad() {
     runner_.load_async(magentart::paths::get_resources_dir(),
                        magentart::paths::get_default_model_dir() + "/mrt2_base.mlxfn",
                        magentart::paths::get_spectrostream_dir() + "/spectrostream_encoder.mlxfn");
     workerRun_.store(true);
     worker_ = std::thread([this] { workerLoop(); });
+}
+
+void PluginProcessor::beginDownload() {
+    if (assetState_.load() == AssetState::Downloading) return;
+    assetState_.store(AssetState::Downloading);
+    dlProgress_.store(0);
+    AssetManager::start_download(
+        [this](float p, const std::string& s) {
+            dlProgress_.store(p);
+            juce::SpinLock::ScopedLockType lk(dlLock_); dlStatus_ = s;
+        },
+        [this](bool ok) {
+            if (ok) { assetState_.store(AssetState::Ready); startEngineLoad(); }
+            else      assetState_.store(AssetState::Failed);
+        });
 }
 
 bool PluginProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {

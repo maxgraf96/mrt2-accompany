@@ -96,8 +96,11 @@ if(MRT2_BUILD_PLUGIN)
         src/PluginProcessor.cpp
         src/PluginEditor.cpp
         src/AccompanyRunner.cpp
+        src/AssetManager.mm
+        "${MAGENTA_COMMON_DIR}/objc/MagentaModelDownloader.mm"
         ${MAGENTA_PATHS_SRC})
-    target_include_directories(MRT2Accompany PRIVATE src "${MAGENTA_COMMON_DIR}/cpp")
+    target_include_directories(MRT2Accompany PRIVATE src
+        "${MAGENTA_COMMON_DIR}/cpp" "${MAGENTA_COMMON_DIR}/objc")
     target_compile_definitions(MRT2Accompany PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
         JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_DISPLAY_SPLASH_SCREEN=0)
@@ -143,8 +146,10 @@ if(MRT2_BUILD_PLUGIN)
     target_sources(m5_drift PRIVATE
         tools/m5_drift.cpp
         src/PluginProcessor.cpp src/PluginEditor.cpp src/AccompanyRunner.cpp
+        src/AssetManager.mm "${MAGENTA_COMMON_DIR}/objc/MagentaModelDownloader.mm"
         ${MAGENTA_PATHS_SRC})
-    target_include_directories(m5_drift PRIVATE src "${MAGENTA_COMMON_DIR}/cpp")
+    target_include_directories(m5_drift PRIVATE src
+        "${MAGENTA_COMMON_DIR}/cpp" "${MAGENTA_COMMON_DIR}/objc")
     target_compile_definitions(m5_drift PRIVATE
         JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_STANDALONE_APPLICATION=1)
     target_link_libraries(m5_drift PRIVATE

@@ -10,6 +10,7 @@
 #include "Mrt2ControlMapper.h"
 #include "HostGridClock.h"
 #include "LoopCapture.h"
+#include "AssetManager.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <atomic>
@@ -58,6 +59,15 @@ public:
     int   uiLevel() const { return uiLevel_.load(); }          // HarmonyLevel; -1 none
     bool  uiLocked() const { return uiLocked_.load(); }
 
+    // First-run asset download state for the UI.
+    enum class AssetState { Checking, Ready, NeedsDownload, Downloading, Failed };
+    AssetState assetState() const { return assetState_.load(); }
+    float downloadProgress() const { return dlProgress_.load(); }
+    juce::String downloadStatus() const {
+        juce::SpinLock::ScopedLockType lk(dlLock_); return dlStatus_;
+    }
+    void beginDownload();
+
     // Force a re-capture + re-prefill of the loop now (Re-lock button).
     void relock() { forceRelock_.store(true); captureReq_.store(true); }
     // Copy the captured-loop waveform peaks for display. Returns the count.
@@ -74,10 +84,15 @@ private:
     static juce::AudioProcessorValueTreeState::ParameterLayout makeParams();
     Knobs knobsFromParams() const;
     HostTransport readTransport(int numSamples);  // playhead -> transport (or synth)
-    void ensureLoaded();                            // load model once, on first prepareToPlay
+    void ensureLoaded();                            // check assets, load once on first prepareToPlay
+    void startEngineLoad();                         // kick the model load + worker
     void workerLoop();                              // background analyze + prefill
 
     std::atomic<bool> loadStarted_{false};
+    std::atomic<AssetState> assetState_{AssetState::Checking};
+    std::atomic<float> dlProgress_{0};
+    mutable juce::SpinLock dlLock_;
+    juce::String dlStatus_;
     std::atomic<float> uiBpm_{0};
     std::atomic<bool> uiPlaying_{false};
     std::atomic<int> uiKeyTonic_{-1};
