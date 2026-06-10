@@ -36,6 +36,7 @@ int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: m5_drift <loop.wav> [--bpm B --bars N --seconds S --block N --prompt P --out F]\n"); return 1; }
     std::string loop = argv[1], prompt = "jazz piano", out = "m5_out.wav";
     double bpm = 120; int bars = 4, seconds = 90, block = 512;
+    double follow = -1, freedom = -1;   // <0 = leave the parameter default
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a=="--bpm") bpm=std::stod(argv[++i]);
         else if (a=="--bars") bars=std::stoi(argv[++i]);
@@ -43,6 +44,8 @@ int main(int argc, char** argv) {
         else if (a=="--block") block=std::stoi(argv[++i]);
         else if (a=="--prompt") prompt=argv[++i];
         else if (a=="--out") out=argv[++i];
+        else if (a=="--follow") follow=std::stod(argv[++i]);
+        else if (a=="--freedom") freedom=std::stod(argv[++i]);
     }
 
     juce::ScopedJuceInitialiser_GUI juceInit;  // MessageManager for APVTS/leak detector
@@ -59,6 +62,8 @@ int main(int argc, char** argv) {
     proc.apvts().getParameter("bpm")->setValueNotifyingHost((float)((bpm - 40.0) / (240.0 - 40.0)));
     proc.apvts().getParameter("bars")->setValueNotifyingHost((float)((bars - 1) / 7.0));
     proc.apvts().getParameter("drymix")->setValueNotifyingHost(0.0f);  // capture AI only
+    if (follow >= 0)  proc.apvts().getParameter("follow")->setValueNotifyingHost((float)follow);
+    if (freedom >= 0) proc.apvts().getParameter("freedom")->setValueNotifyingHost((float)freedom);
     proc.setPlayConfigDetails(2, 2, SR, block);
     proc.prepareToPlay(SR, block);
 

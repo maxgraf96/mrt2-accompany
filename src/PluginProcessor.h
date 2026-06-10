@@ -72,8 +72,12 @@ public:
     // Request a re-capture + re-prefill of the loop. Deferred to the next loop
     // boundary so the captured window is bar-aligned (avoids rotating the
     // chord-to-beat mapping vs the host grid). processBlock promotes this to a
-    // forced capture when it next crosses a boundary.
-    void relock() { relockPending_.store(true); }
+    // forced capture when it next crosses a boundary. Pre-arm ring headroom now
+    // so the prefill stall at that boundary is bridged without an audio gap.
+    void relock() {
+        relockPending_.store(true);
+        runner_.set_buffer_target_frames(prefillHeadroomFrames());
+    }
     bool relockPending() const { return relockPending_.load(); }
     // Copy the captured-loop waveform peaks for display. Returns the count.
     int  copyWaveform(std::vector<float>& dest) const {
@@ -95,6 +99,19 @@ private:
     void ensureLoaded();                            // check assets, load once on first prepareToPlay
     void startEngineLoad();                         // kick the model load + worker
     void workerLoop();                              // background analyze + prefill
+
+    // Ring headroom (25 fps frames) that bridges a prefill stall, sized from
+    // the last measured prefill duration (generation refills at ~1.5-2x).
+    // Kept tight: whatever headroom the prefill doesn't consume plays back as
+    // pre-prefill audio afterwards, delaying the refreshed context.
+    int prefillHeadroomFrames() const {
+        const float ms = runner_.last_prefill_ms();
+        const int frames = (int)(ms / 40.0f * 1.15f) + 8;
+        return juce::jlimit(25, 240, frames);
+    }
+    // Prefill audio for (re-)grounding: input loop alone, or the input + our
+    // own recent layer (gain-corrected), tiled to the minimum prefill length.
+    std::vector<float> buildPrefillAudio(const CapturedLoop& in, bool mixOwnLayer);
 
     std::atomic<bool> loadStarted_{false};
     std::atomic<AssetState> assetState_{AssetState::Checking};
@@ -119,6 +136,10 @@ private:
     // inside AccompanyRunner's inference loop; here we only set its phase anchor.
     HostGridClock clock_;
     LoopCapture capture_;
+    // What WE played, captured in lockstep with the input — re-grounding
+    // prefills with the input+AI mix so the model keeps hearing the ensemble.
+    LoopCapture aiCapture_;
+    std::vector<float> aiPushL_, aiPushR_;  // audio-thread scratch (preallocated)
 
     std::thread worker_;
     std::atomic<bool> workerRun_{false};

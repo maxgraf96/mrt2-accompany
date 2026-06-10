@@ -61,13 +61,32 @@ struct Knobs {
 
 // Macro -> CFG mappings. Shared by resolve_params and the plugin's macro
 // listener so the knob values and the engine values never disagree.
+//
+// Freedom only bleeds a LITTLE style guidance away: dropping cfg_musiccoca
+// hard made high Freedom hug the prefilled INPUT context harder (the opposite
+// of what the knob promises) — the style prompt is what pulls the model away
+// from echoing the bassline.
 inline float cfg_musiccoca_from_freedom(float freedom) {
-    return std::clamp(4.5f - 2.0f * std::clamp(freedom, 0.0f, 1.0f), 0.0f, 8.0f);
+    return std::clamp(4.5f - 1.5f * std::clamp(freedom, 0.0f, 1.0f), 0.0f, 8.0f);
 }
+// Follow 0 -> 1.0 (a whisper of harmony), 0.4 (default) -> ~4.0 (the tuned
+// "locked + flowing" point), 1 -> 6.5 (tightly locked). Quadratic so the
+// default stays where it was tuned while the bottom end actually lets go.
 inline float cfg_notes_from_follow(float follow) {
-    return std::clamp(2.5f + 4.0f * std::clamp(follow, 0.0f, 1.0f), -1.0f, 7.0f);
+    const float f = std::clamp(follow, 0.0f, 1.0f);
+    return std::clamp(1.0f + 9.0f * f - 3.5f * f * f, -1.0f, 7.0f);
 }
 inline float cfg_drums_from_toggle(bool drums) { return drums ? 1.0f : 3.0f; }
+
+// Follow also sets the chord-pulse density of the MIDI plan itself (the CFG
+// scale alone can't unstick the rhythm: re-onsetting every chord tone on
+// every beat IS a quarter-note instruction, however weak the guidance).
+// Returns the re-articulation period in beats; 0 = only on chord changes.
+inline int rearticulation_period_from_follow(float follow) {
+    if (follow >= 0.55f) return 1;   // every beat: tight rhythmic lock
+    if (follow >= 0.25f) return 2;   // half-note pulse
+    return 0;                        // chord changes only: free rhythm
+}
 
 // Resolved engine parameters for one configuration (the §6 table).
 struct EngineParams {
@@ -98,12 +117,28 @@ std::pair<int, int> choose_register(const std::array<float, 128>& pitch_energy);
 // the new voicing, exactly on that beat's frame. Common tones are re-articulated
 // (off then on) so every beat carries a pulse onset (helps tempo lock). The
 // returned vector is sorted by (frame, off-before-on).
+//
+// `iterations` > 1 makes the plan span that many consecutive loop iterations,
+// each voiced as a different INVERSION of the same chords (iteration k rotates
+// the voicing k steps). Same harmony, same beat-grid onsets — but the
+// conditioning the model sees changes loop to loop, so the accompaniment is
+// nudged to develop instead of orbiting one fixed response. The driver
+// (AccompanyRunner) advances through iterations even when the host transport
+// wraps backward at a clip-loop boundary.
 struct MidiPlan {
     std::vector<MidiEvent> events;
-    int frames_per_loop = 0;
+    int frames_per_loop = 0;       // total span of the plan (= iterations * frames_per_iteration)
+    int frames_per_iteration = 0;  // one musical loop
+    int iterations = 1;
     double frames_per_beat = 0;
 };
-MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double fps = 25.0);
+MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double fps = 25.0,
+                         int iterations = 1);
+
+// Rotate a voiced chord to its k-th inversion inside [lo, hi]: the lowest
+// `k % size` notes move up an octave (folded back down if they would leave the
+// register). Exposed for tests.
+std::vector<int> invert_voicing(std::vector<int> notes, int k, int lo, int hi);
 
 // Abstract destination for driving notes (the engine implements this).
 struct NoteSink {

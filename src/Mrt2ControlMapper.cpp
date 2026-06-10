@@ -83,12 +83,30 @@ std::pair<int, int> choose_register(const std::array<float, 128>& pitch_energy) 
     return {best_lo, best_lo + kSpan};
 }
 
-MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double fps) {
+std::vector<int> invert_voicing(std::vector<int> notes, int k, int lo, int hi) {
+    if (notes.size() < 2 || k <= 0) return notes;
+    const int rot = k % (int)notes.size();
+    for (int i = 0; i < rot; ++i) {
+        int n = notes[(size_t)i] + 12;
+        if (n > hi) n = notes[(size_t)i];  // would leave the register: keep in place
+        notes[(size_t)i] = n;
+    }
+    std::sort(notes.begin(), notes.end());
+    notes.erase(std::unique(notes.begin(), notes.end()), notes.end());
+    (void)lo;
+    return notes;
+}
+
+MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double fps,
+                         int iterations) {
     MidiPlan plan;
     const int total_beats = (int)a.beats.size();
     if (total_beats == 0 || bpm <= 0) return plan;
+    if (iterations < 1) iterations = 1;
     plan.frames_per_beat = (60.0 / bpm) * fps;
-    plan.frames_per_loop = (int)std::llround(total_beats * plan.frames_per_beat);
+    plan.frames_per_iteration = (int)std::llround(total_beats * plan.frames_per_beat);
+    plan.iterations = iterations;
+    plan.frames_per_loop = plan.frames_per_iteration * iterations;
 
     // Register: explicit override, else occupancy-aware auto.
     int lo = k.register_lo, hi = k.register_hi;
@@ -110,26 +128,47 @@ MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double f
         }
     }
 
-    std::vector<int> held;  // currently sounding pitches
-    for (int b = 0; b < total_beats; ++b) {
-        int frame = (int)std::llround(b * plan.frames_per_beat);
-        const std::vector<int>& next = voicings[b];
-        bool rearticulate = !atonal || (a.beats_per_bar > 0 && b % a.beats_per_bar == 0);
+    // Pulse density follows the Follow knob: every beat when tightly locked,
+    // sparser (half notes / chord-changes-only) as the user lets go. Held
+    // notes between pulses become weak "continuation" tokens, so the model
+    // keeps the harmony but invents its own rhythm.
+    const int pulse = rearticulation_period_from_follow(k.follow_input);
 
-        // Release every held note that is not in `next` (chord change).
-        for (int p : held) {
-            if (std::find(next.begin(), next.end(), p) == next.end())
-                plan.events.push_back({frame, p, false});
+    std::vector<int> held;  // currently sounding pitches, carried across iterations
+    for (int it = 0; it < iterations; ++it) {
+        const int it_base = it * plan.frames_per_iteration;
+        for (int b = 0; b < total_beats; ++b) {
+            int frame = it_base + (int)std::llround(b * plan.frames_per_beat);
+            std::vector<int> next = invert_voicing(voicings[b], it, lo, hi);
+            // Beat 0 of each iteration always pulses (the loop's tempo anchor).
+            bool rearticulate = atonal
+                ? (a.beats_per_bar > 0 && b % a.beats_per_bar == 0)
+                : (b == 0 || (pulse > 0 && b % pulse == 0));
+
+            // Release every held note that is not in `next` (chord change).
+            for (int p : held) {
+                if (std::find(next.begin(), next.end(), p) == next.end())
+                    plan.events.push_back({frame, p, false});
+            }
+            // Re-articulate common tones (off then on) so the beat carries a pulse —
+            // every beat when locked to harmony, once per bar for the atonal pad.
+            for (int p : next) {
+                bool was_held = std::find(held.begin(), held.end(), p) != held.end();
+                if (was_held && !rearticulate) continue;  // sustain through the bar
+                if (was_held) plan.events.push_back({frame, p, false});
+                plan.events.push_back({frame, p, true});
+            }
+            held = next;
         }
-        // Re-articulate common tones (off then on) so the beat carries a pulse —
-        // every beat when locked to harmony, once per bar for the atonal pad.
-        for (int p : next) {
-            bool was_held = std::find(held.begin(), held.end(), p) != held.end();
-            if (was_held && !rearticulate) continue;  // sustain through the bar
-            if (was_held) plan.events.push_back({frame, p, false});
-            plan.events.push_back({frame, p, true});
-        }
-        held = next;
+    }
+    // Close the cycle: the last iteration's final voicing must release anything
+    // the first iteration's beat 0 doesn't re-onset, or it would hang forever
+    // when the plan wraps. Beat 0 re-articulates, so only emit the missing offs.
+    {
+        const std::vector<int> first = invert_voicing(voicings[0], 0, lo, hi);
+        for (int p : held)
+            if (std::find(first.begin(), first.end(), p) == first.end())
+                plan.events.push_back({0, p, false});
     }
 
     // Stable order: by frame, note-offs before note-ons at the same frame.

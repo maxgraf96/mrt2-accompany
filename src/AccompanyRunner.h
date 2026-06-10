@@ -10,10 +10,10 @@
 // scheduling around it.
 
 #pragma once
+#include "AudioRing.h"
 #include "Mrt2ControlMapper.h"
 
 #include <magentart/mlx_engine.h>
-#include <magentart/ring_buffer.h>
 
 #include <array>
 #include <atomic>
@@ -47,6 +47,13 @@ public:
     void set_lookahead_frames(int frames);
     int  lookahead_frames() const { return lookahead_frames_.load(); }
 
+    // Generate-ahead depth target (in 25 fps frames), normally == lookahead.
+    // Raise it ahead of a scheduled re-ground prefill so the ring holds enough
+    // audio to bridge the prefill stall without a gap; prefill() restores it
+    // to the lookahead automatically when it finishes.
+    void set_buffer_target_frames(int frames);
+    int  buffer_target_frames() const { return buffer_target_frames_.load(); }
+
     // Conditioning.
     void set_prompt(const std::string& text);
     void apply_params(const EngineParams& p);
@@ -65,25 +72,39 @@ public:
     void note_on(int pitch) override;
     void note_off(int pitch) override;
 
-    // Re-prefill from a captured loop (stops the inference loop, seeds the KV
-    // cache, restarts). Controller thread; a brief seam gap is expected.
-    bool prefill(const float* stereo48k, int frames);
+    // Re-prefill from a captured loop (stops the inference loop, feeds the KV
+    // cache, restarts). Controller thread; the stall is bridged by ring
+    // headroom when pre-armed via set_buffer_target_frames. The engine APPENDS
+    // prefill tokens to the live state, so a short clip refreshes the context
+    // without erasing the model's own recent history.
+    //
+    // Trims: -1 = auto (symmetric, loop-length-aware). Pass explicit values to
+    // control which part of the encoded clip lands in the context — prefill
+    // cost is dominated by the per-frame transformer loop over the KEPT frames
+    // (~the generation frame cost each), so shorter kept windows stall less.
+    bool prefill(const float* stereo48k, int frames,
+                 int trim_front = -1, int trim_back = -1);
 
     // Drain the ring (re-anchor at a loop seam / transport jump).
     void reanchor();
 
-    // Metrics for UI.
+    // Metrics for UI / re-ground scheduling.
     float last_frame_ms() const { return frame_ms_.load(std::memory_order_relaxed); }
+    float last_prefill_ms() const { return prefill_ms_.load(std::memory_order_relaxed); }
     std::uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
 
 private:
-    // Edge events indexed by loop frame. The inference loop emits this frame's
+    // Edge events indexed by plan frame. The inference loop emits this frame's
     // events each generated frame (single-frame, like tools/m3_condition), so
     // chord tones re-onset every beat — which is what actually conditions the
     // model strongly enough to suppress the bass (held/continuation notes don't).
+    // A plan spans `iterations` musical loops (`frames_per_iteration` each) so
+    // voicings can vary loop-to-loop; the sweep advances through iterations
+    // even when the host transport wraps backward at a clip-loop boundary.
     struct PlanIndex {
-        std::vector<std::vector<MidiEvent>> by_frame;  // [loop_frame] -> events
-        int frames_per_loop = 0;
+        std::vector<std::vector<MidiEvent>> by_frame;  // [plan_frame] -> events
+        int frames_per_loop = 0;       // total plan span
+        int frames_per_iteration = 0;  // one musical loop
     };
 
     void inference_loop();
@@ -91,7 +112,7 @@ private:
     void stop_inference();
 
     magentart::core::MLXEngine engine_;
-    magentart::core::RingBuffer ringL_, ringR_;
+    AudioRing ringL_, ringR_;
 
     std::atomic<LoadState> state_{LoadState::Idle};
     std::thread loader_;
@@ -99,15 +120,21 @@ private:
     std::thread inf_thread_;
     std::atomic<bool> running_{false};
     std::atomic<int> lookahead_frames_{3};
+    std::atomic<int> buffer_target_frames_{3};
 
     std::shared_ptr<PlanIndex> plan_;       // guarded by plan_mutex_ (swap is rare)
     mutable std::mutex plan_mutex_;
     std::atomic<long> gen_count_{0};
     std::atomic<long> phase_adjust_{0};
     std::atomic<bool> playing_{false};
-    long last_emitted_ = -1;                // inference-thread only: last loop frame emitted
+    // Inference-thread-only sweep state.
+    long last_emitted_ = -1;                // last plan frame emitted
+    long wrap_offset_ = 0;                  // accumulated host loop-wrap correction
+    const PlanIndex* last_plan_seen_ = nullptr;  // detects plan swaps (identity only)
+    bool fade_in_pending_ = false;          // ramp the first post-prefill frame
 
     std::atomic<float> frame_ms_{0};
+    std::atomic<float> prefill_ms_{4000.0f};  // pessimistic until first measured
     std::atomic<std::uint64_t> dropped_{0};
 
     std::string pending_prompt_;

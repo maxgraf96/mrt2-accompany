@@ -3,6 +3,7 @@
 
 #include "magenta_paths.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <vector>
@@ -146,6 +147,9 @@ void PluginProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
 
     clock_.reset();
     capture_.prepare(sampleRate, 30.0);
+    aiCapture_.prepare(sampleRate, 30.0);
+    aiPushL_.assign((size_t)samplesPerBlock + 16, 0.0f);
+    aiPushR_.assign((size_t)samplesPerBlock + 16, 0.0f);
     synthSamplePos_ = 0;
 }
 
@@ -205,7 +209,9 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
 
     const int bars = (int)apvts_.getRawParameterValue("bars")->load();
     const int beatsPerLoop = juce::jmax(1, bars * grid.beats_per_bar);
-    capture_.set_loop_length_samples((int)std::llround(beatsPerLoop * grid.samples_per_beat));
+    const int loopSamples = (int)std::llround(beatsPerLoop * grid.samples_per_beat);
+    capture_.set_loop_length_samples(loopSamples);
+    aiCapture_.set_loop_length_samples(loopSamples);
 
     // Raw playhead engine-frame (25 fps). The runner adds the ring depth itself
     // in set_phase, so do NOT add lookahead here (it would double-count).
@@ -221,7 +227,11 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
             // A pending Re-lock fires here, bar-aligned: force the re-prefill even
             // if the loop is unchanged. The capture window now ends on the boundary.
             if (relockPending_.exchange(false)) forceRelock_.store(true);
-            if (grid.wrapped || grid.started) runner_.reanchor();  // drain ring at the seam
+            // Drain the ring only on transport START (stale frames from the
+            // stopped period). A routine clip-loop WRAP is a musical
+            // continuation: the buffered frames are phase-correct mod loop, and
+            // draining them gapped the downbeat of every loop in a looping DAW.
+            if (grid.started) runner_.reanchor();
         }
         prevLoopIndex_ = loopIndex;
         // Anchor the inference loop's per-frame MIDI to the host playhead.
@@ -229,14 +239,18 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     }
 
     // Produce the AI layer at host SR into the first two output channels — but
-    // ONLY while the host transport is playing. When stopped, the AI layer is
-    // silent (we don't pull the ring, so the inference loop back-pressures and
-    // idles); the optional dry passthrough below still works for monitoring.
+    // ONLY while the host transport is playing AND we have locked onto the
+    // input at least once (captured + analyzed + prefilled -> plan present).
+    // Before the first lock the engine free-runs on the style prompt alone;
+    // that must never reach the output — a freshly opened plugin is silent.
+    // When muted we don't pull the ring, so the inference loop back-pressures
+    // and idles; the optional dry passthrough below still works for monitoring.
     float* outL = buffer.getWritePointer(0);
     float* outR = buffer.getWritePointer(juce::jmin(1, nOut - 1));
     const double ratio = 48000.0 / hostSampleRate_;
+    const bool locked = runner_.has_plan();
 
-    if (!grid.playing) {
+    if (!grid.playing || !locked) {
         std::fill(outL, outL + nBlk, 0.0f);
         std::fill(outR, outR + nBlk, 0.0f);
         stageLen_ = 0;  // drop stale resampler input so play-start is clean
@@ -267,8 +281,10 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     const float dryMix = apvts_.getRawParameterValue("drymix")->load();
     const float gain = juce::Decibels::decibelsToGain(apvts_.getRawParameterValue("outgain")->load());
     const bool haveDry = nIn > 0 && dryMix > 1e-5f;
+    const bool captureAi = grid.playing && locked && (int)aiPushL_.size() >= nBlk;
     for (int i = 0; i < nBlk; ++i) {
         float l = outL[i] * gain, r = outR[i] * gain;
+        if (captureAi) { aiPushL_[(size_t)i] = l; aiPushR_[(size_t)i] = r; }
         if (haveDry) {
             l += dry.getSample(0, i) * dryMix;
             r += dry.getSample(juce::jmin(1, dry.getNumChannels() - 1), i) * dryMix;
@@ -276,6 +292,9 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
         outL[i] = softClip(l);
         outR[i] = softClip(r);
     }
+    // Track our own layer in lockstep with the input capture so a re-ground
+    // prefill can feed the model the actual ensemble (input + AI) it produced.
+    if (captureAi) aiCapture_.push(aiPushL_.data(), aiPushR_.data(), nBlk);
     // Clear any extra output channels.
     for (int ch = 2; ch < nOut; ++ch) buffer.clear(ch, 0, nBlk);
 }
@@ -294,20 +313,66 @@ Knobs PluginProcessor::knobsFromParams() const {
     return k;  // register_lo/hi stay -1 (occupancy-aware auto)
 }
 
-// Background worker: on a capture request, snapshot the just-completed loop,
-// analyze it, and — only if the input changed — re-prefill + swap in a fresh
-// chord-MIDI plan. Prefill stops/restarts the inference loop (a brief seam gap),
-// so it must run here, off the audio thread.
+// Background worker — the plugin's "ears". On every loop boundary it snapshots
+// the just-completed iteration, ALWAYS analyzes it and refreshes the chord-MIDI
+// plan (cheap, seamless — this is what tracks the player), and decides whether
+// to re-ground the model's KV context with a prefill (bursty, brief seam):
+//   - first capture / Re-lock / input change (coarse or harmonic): yes;
+//   - otherwise periodically, before the last grounding slides out of the
+//     model's ~20 s receptive field. Without this the model ends up hearing
+//     only its own output and regresses to quiet, timid playing (measured:
+//     -20 dB -> -35 dB within 15 s of the prefill leaving the window).
+// Periodic re-grounds prefill the MIX of input + our own recent layer, with
+// the layer gain-corrected to the input's level — continuity comes from its
+// own audio being in the context, loudness from the gain correction.
 void PluginProcessor::workerLoop() {
     using namespace std::chrono_literals;
+    using clock = std::chrono::steady_clock;
+    auto lastPrefill = clock::now();
+    bool havePrefilled = false;
+    bool preArmed = false;
+    std::vector<MidiEvent> lastPlanEvents;
+    int lastPlanFrames = 0;
+    std::vector<int> lastHarmonySig;
+    // Key hysteresis: K-S on a thirds-free input (a bassline) flaps between
+    // relative keys (Am <-> C) across captures of the SAME audio, and the key
+    // drives the harmonize-tier chords -> the whole plan flaps with it. Adopt
+    // a new key only when detected twice in a row; meanwhile re-analyze with
+    // the accepted key locked so chords stay consistent.
+    int acceptedTonic = -1; bool acceptedMajor = false;
+    int pendingTonic = -1;  bool pendingMajor = false;
+
+    // Re-ground cadence: the model attends to ~500 frames (~20 s); the periodic
+    // refresher appends a few seconds of grounding, so refresh roughly every
+    // 12 s of free-running.
+    constexpr double kCtxMaxSec = 12.0;
+
     while (workerRun_.load()) {
+        // Pre-arm: when the next boundary is likely to re-ground, deepen the
+        // ring target so generation builds enough audio to bridge the prefill.
+        // Headroom builds only at (1 - frame_ms/40ms) of realtime — measured
+        // ~0.15-0.25x on an M-Max — so start early; arming early just means
+        // the ring sits deeper for a while (conditioning latency, not output
+        // latency), while arming late means an audible gap at the re-ground.
+        const double ctxAge = std::chrono::duration<double>(clock::now() - lastPrefill).count();
+        // (Not before the first lock: until then the output is muted, so the
+        // first prefill's stall is inaudible and headroom would only delay it.)
+        if (havePrefilled && playing_.load() && !preArmed) {
+            const int headroom = prefillHeadroomFrames();
+            const double buildSec = headroom * 0.04 / 0.15 + 1.0;
+            if (ctxAge >= kCtxMaxSec - buildSec) {
+                runner_.set_buffer_target_frames(headroom);
+                preArmed = true;
+            }
+        }
+
         if (!captureReq_.exchange(false)) { std::this_thread::sleep_for(20ms); continue; }
         if (!runner_.ready()) continue;
         const bool force = forceRelock_.exchange(false);   // Re-lock button: always re-prefill
 
         CapturedLoop c;
         if (!capture_.snapshot(c)) continue;
-        if (!force && !capture_.is_change(c)) continue;   // unchanged loop -> keep evolving
+        const bool coarseChange = capture_.is_change(c);   // RMS/brightness delta (updates ref)
 
         // Captured-loop waveform peaks for the editor (downsample mono -> ~256).
         {
@@ -322,36 +387,180 @@ void PluginProcessor::workerLoop() {
             wavePeaks_.swap(peaks);
         }
 
+        if (c.rms < 1.5e-3) continue;  // near-silent input: nothing to listen to
+
         const double bpm = curBpm_.load();
         const int beatsPerBar = curBeatsPerBar_.load();
         const int bars = juce::jmax(1, (int)apvts_.getRawParameterValue("bars")->load());
 
         AnalyzerConfig acfg;
-        if (apvts_.getRawParameterValue("keylock")->load() > 0.5f) {
+        const bool userKeyLock = apvts_.getRawParameterValue("keylock")->load() > 0.5f;
+        if (userKeyLock) {
             acfg.key_lock_tonic = (int)apvts_.getRawParameterValue("keytonic")->load();
             acfg.key_lock_major = apvts_.getRawParameterValue("keymajor")->load() > 0.5f;
         }
         Analysis a = analyze_loop(c.mono48k.data(), c.frames48k, 48000.0, bpm, beatsPerBar, bars, acfg);
+        if (!userKeyLock) {
+            const bool isAccepted = a.key.tonic == acceptedTonic &&
+                                    (a.key.mode == Mode::Major) == acceptedMajor;
+            if (acceptedTonic < 0 || isAccepted) {
+                acceptedTonic = a.key.tonic; acceptedMajor = (a.key.mode == Mode::Major);
+                pendingTonic = -1;
+            } else if (a.key.tonic == pendingTonic && (a.key.mode == Mode::Major) == pendingMajor) {
+                // Second consecutive sighting: a real key change — adopt it.
+                acceptedTonic = pendingTonic; acceptedMajor = pendingMajor;
+                pendingTonic = -1;
+            } else {
+                // First sighting of a different key: remember it, but analyze
+                // this capture with the accepted key locked (stable chords).
+                pendingTonic = a.key.tonic; pendingMajor = (a.key.mode == Mode::Major);
+                acfg.key_lock_tonic = acceptedTonic;
+                acfg.key_lock_major = acceptedMajor;
+                a = analyze_loop(c.mono48k.data(), c.frames48k, 48000.0, bpm, beatsPerBar, bars, acfg);
+            }
+        }
         uiKeyTonic_.store(a.key.tonic);
         uiKeyMajor_.store(a.key.mode == Mode::Major);
         uiLevel_.store((int)a.level);
-        MidiPlan plan = build_midi_plan(a, bpm, knobsFromParams());
 
-        // Tile the captured loop up to >= 8 s so RealtimeRunner's fixed 25/25-frame
-        // trim leaves a usable prefill even for 1-2 bar loops (engine-reality flag).
+        // Harmony signature: key + per-beat (root, quality). Catches the player
+        // moving to a new progression even at unchanged level/brightness, which
+        // the coarse RMS/zero-cross detector is blind to. Detection on the same
+        // audio can flap on single ambiguous beats (the capture window jitters
+        // by a few ms per loop), so require the key or >25% of beats to move
+        // before treating it as a real change.
+        std::vector<int> sig;
+        sig.reserve(a.beats.size() * 2 + 2);
+        sig.push_back(a.key.tonic);
+        sig.push_back((int)a.key.mode);
+        for (const auto& ch : a.beats) { sig.push_back(ch.root); sig.push_back((int)ch.quality); }
+        bool harmonicChange = false;
+        if (!lastHarmonySig.empty() && sig.size() == lastHarmonySig.size() && sig.size() > 2) {
+            const bool keyChanged = sig[0] != lastHarmonySig[0] || sig[1] != lastHarmonySig[1];
+            int diffBeats = 0;
+            const int beats = (int)(sig.size() - 2) / 2;
+            for (int b = 0; b < beats; ++b)
+                if (sig[(size_t)(2 + 2 * b)] != lastHarmonySig[(size_t)(2 + 2 * b)] ||
+                    sig[(size_t)(3 + 2 * b)] != lastHarmonySig[(size_t)(3 + 2 * b)]) ++diffBeats;
+            harmonicChange = keyChanged || (beats > 0 && (float)diffBeats / (float)beats > 0.25f);
+        } else if (!lastHarmonySig.empty() && sig.size() != lastHarmonySig.size()) {
+            harmonicChange = true;  // loop length / meter changed
+        }
+        lastHarmonySig = std::move(sig);
+
+        // Always rebuild the plan from THIS loop's analysis — but only swap it
+        // in when it differs (a swap sweeps held notes off, so identical swaps
+        // would blip the conditioning once per loop for nothing). The plan
+        // spans 4 iterations with rotated voicings so the conditioning itself
+        // develops loop to loop instead of pinning one fixed response.
+        MidiPlan plan = build_midi_plan(a, bpm, knobsFromParams(), 25.0, /*iterations=*/4);
+        const bool planChanged = plan.frames_per_loop != lastPlanFrames ||
+            plan.events.size() != lastPlanEvents.size() ||
+            !std::equal(plan.events.begin(), plan.events.end(), lastPlanEvents.begin(),
+                        [](const MidiEvent& x, const MidiEvent& y) {
+                            return x.frame == y.frame && x.pitch == y.pitch && x.on == y.on;
+                        });
+        // The FIRST lock must not unmute the output (has_plan) until the
+        // grounded audio exists: prefill first, drop the pre-lock freestyle
+        // still in the ring, THEN swap in the plan. After that, plans swap
+        // immediately (cheap, seamless) and grounding follows.
+        const bool firstGround = !havePrefilled;
+        if (!firstGround && planChanged) {
+            lastPlanEvents = plan.events;
+            lastPlanFrames = plan.frames_per_loop;
+            runner_.set_plan(plan);
+        }
+
+        const bool fullGround = force || firstGround;
+        const bool needGround = fullGround || coarseChange || harmonicChange ||
+                                ctxAge >= kCtxMaxSec;
+        if (needGround) {
+            // First grounding / explicit Re-lock: full re-seed from the input
+            // alone (clean take). Everything else: a short REFRESHER of the
+            // input + our own layer appended to the model's live context —
+            // continuity is free (its own history stays in the KV cache) and
+            // the stall is roughly half of a full prefill.
+            std::vector<float> pre = buildPrefillAudio(c, !fullGround);
+            const int preFrames = (int)(pre.size() / 2);
+            const bool ok = preFrames > 50 &&
+                (fullGround ? runner_.prefill(pre.data(), preFrames)
+                            : runner_.prefill(pre.data(), preFrames, 25, 25));
+            if (ok) {
+                lastPrefill = clock::now();
+                havePrefilled = true;
+                if (firstGround) {
+                    // Safe to act as the ring consumer here: the audio thread
+                    // is still muted (no plan yet) and not reading.
+                    runner_.reanchor();
+                    lastPlanEvents = plan.events;
+                    lastPlanFrames = plan.frames_per_loop;
+                    runner_.set_plan(plan);  // unmutes the output
+                }
+            }
+            preArmed = false;  // prefill() restored the buffer target
+        }
+    }
+}
+
+// Assemble grounding audio.
+//
+// Full grounding (mixOwnLayer=false): the input loop tiled to >= 8 s so the
+// engine's symmetric trim still leaves a usable window for 1-2 bar loops.
+//
+// Refresher (mixOwnLayer=true): input summed with our own captured layer,
+// gain-corrected to the input's level — the loudness servo lives HERE, in the
+// context the model hears, not on the output. Since prefill APPENDS to the
+// live state, we only feed a ~3 s tail (plus 1 s pre/post-roll that the 25/25
+// trim discards; the post-roll wraps to the loop start so the kept window
+// ends exactly at the loop boundary with clean, non-padded tokens). Prefill
+// cost scales with the kept frames, so this stalls ~half as long as a full
+// grounding.
+std::vector<float> PluginProcessor::buildPrefillAudio(const CapturedLoop& in, bool mixOwnLayer) {
+    std::vector<float> loop = in.stereo48k;
+    const int loopFrames = (int)(loop.size() / 2);
+    if (loopFrames <= 0) return {};
+
+    if (!mixOwnLayer) {
         constexpr int kMinPrefill = 8 * 48000;
         std::vector<float> pre;
-        if (c.frames48k > 0) {
-            const int reps = juce::jmax(1, (kMinPrefill + c.frames48k - 1) / c.frames48k);
-            pre.reserve((size_t)c.frames48k * 2 * reps);
-            for (int r = 0; r < reps; ++r)
-                pre.insert(pre.end(), c.stereo48k.begin(), c.stereo48k.end());
-        }
-        const int preFrames = (int)(pre.size() / 2);
-        if (preFrames > 50) runner_.prefill(pre.data(), preFrames);  // stops/restarts inference
-
-        runner_.set_plan(plan);  // inference loop conditions it per-frame
+        const int reps = juce::jmax(1, (kMinPrefill + loopFrames - 1) / loopFrames);
+        pre.reserve(loop.size() * (size_t)reps);
+        for (int r = 0; r < reps; ++r)
+            pre.insert(pre.end(), loop.begin(), loop.end());
+        return pre;
     }
+
+    CapturedLoop ai;
+    if (aiCapture_.snapshot(ai) && ai.valid && ai.rms > 1e-4) {
+        const size_t n = std::min(loop.size(), ai.stereo48k.size());
+        // Our layer should sit just under the input in the context mix;
+        // boost-only (never duck a healthy layer), capped at +12 dB.
+        const float boost = (float)juce::jlimit(1.0, 4.0, 0.85 * in.rms / std::max(1e-4, ai.rms));
+        float peak = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            loop[i] += boost * ai.stereo48k[i];
+            peak = std::max(peak, std::abs(loop[i]));
+        }
+        if (peak > 0.95f) {  // keep the encoder input clip-free
+            const float s = 0.95f / peak;
+            for (auto& v : loop) v *= s;
+        }
+    }
+
+    // [1 s pre-roll][refresher tail][1 s post-roll], all indexed circularly so
+    // the loop wraps seamlessly; the caller trims 25/25 frames, keeping a tail
+    // that ends exactly at the loop boundary.
+    constexpr int kRollFrames = 25 * 1920;             // 1 s @ 48 kHz
+    const int tailFrames = juce::jmin(loopFrames, 60 * 1920);  // <= 2.4 s
+    const int total = kRollFrames + tailFrames + kRollFrames;
+    std::vector<float> pre((size_t)total * 2);
+    const long start = (long)loopFrames - kRollFrames - tailFrames;  // may be negative: wraps
+    for (int i = 0; i < total; ++i) {
+        const long src = (((start + i) % loopFrames) + loopFrames) % loopFrames;
+        pre[(size_t)i * 2]     = loop[(size_t)src * 2];
+        pre[(size_t)i * 2 + 1] = loop[(size_t)src * 2 + 1];
+    }
+    return pre;
 }
 
 void PluginProcessor::setPrompt(const juce::String& p) {
