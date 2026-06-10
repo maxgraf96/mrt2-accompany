@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 namespace mrt2 {
@@ -29,12 +30,26 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     // The three CFG (classifier-free guidance) scales as direct knobs. Freedom/
     // Follow/Drums are macros that write into these one-way (see ctor listener),
     // so defaults match the macro mappings for the default macro positions.
-    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgstyle", 1}, "CFG Style", R{0.f, 8.f},
+    // CFG ranges follow the model's documented [-1, 7]; the old 0..8 ranges let
+    // the style scale run past the trained regime, which degrades the audio
+    // into smeared/percussive output (and with the loop-latent blend active it
+    // simultaneously drags the style TOWARD the input's timbre).
+    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgstyle", 1}, "CFG Style", R{0.f, 7.f},
                                     cfg_musiccoca_from_freedom(0.35f)));
     p.push_back(std::make_unique<P>(juce::ParameterID{"cfgnotes", 1}, "CFG Notes", R{-1.f, 7.f},
                                     cfg_notes_from_follow(0.4f)));
-    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgdrums", 1}, "CFG Drums", R{0.f, 8.f},
+    p.push_back(std::make_unique<P>(juce::ParameterID{"cfgdrums", 1}, "CFG Drums", R{0.f, 7.f},
                                     cfg_drums_from_toggle(false)));
+    // MusicCoCa blend quantizes to 12 discrete style tokens, so tiny audio-
+    // blend changes can cause large style jumps. Keep this intentionally small:
+    // above ~0.1 bass/drum loops tend to pull the style into source-copying.
+    p.push_back(std::make_unique<P>(juce::ParameterID{"styleblend", 1}, "Style Blend", R{0.f, 0.1f}, 0.03f));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"contextfeedback", 1}, "Context Feedback", R{0.f, 1.f}, 1.0f));
+    // Automatic KV refresh cadence in musical bars. 0 = manual-only.
+    p.push_back(std::make_unique<P>(juce::ParameterID{"contextrefresh", 1}, "Context Refresh", R{0.f, 16.f}, 4.0f));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"hintdensity", 1}, "Hint Density", R{0.f, 1.f}, 0.4f));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"hinthold", 1}, "Hint Hold", R{0.f, 1.f}, 0.4f));
+    p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"unmask", 1}, "Unmask", 0, 8, 3));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"variation", 1}, "Variation", 0, 15, 0));
     p.push_back(std::make_unique<P>(juce::ParameterID{"drymix", 1}, "Dry Mix", R{0.f, 1.f}, 0.0f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"outgain", 1}, "Output Gain", R{-24.f, 12.f}, 0.0f));
@@ -44,6 +59,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{"keymajor", 1}, "Scale",
                 juce::StringArray{"Minor", "Major"}, 0));  // index 0=Minor; raw>0.5 => Major
     p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"keylock", 1}, "Lock Key", false));
+    // Note Guide OFF = the radical mode: NO pianoroll conditioning at all.
+    // The model is steered purely by what it hears (context re-grounding with
+    // the input + its own layer) and the blended style prompt. No harmony
+    // hints, no beat-aligned onsets (tempo holds only via the boundary-aligned
+    // re-grounds), no bass fence. ON restores the chord-hint machinery.
+    p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"noteguide", 1}, "Note Guide", false));
     return { p.begin(), p.end() };
 }
 
@@ -81,8 +102,17 @@ void PluginProcessor::parameterChanged(const juce::String& id, float value) {
         if (auto* pf = dynamic_cast<juce::AudioParameterFloat*>(apvts_.getParameter(pid)))
             *pf = v;   // denormalized set + host notify
     };
+    auto setIntParam = [this](const char* pid, int v) {
+        if (auto* pi = dynamic_cast<juce::AudioParameterInt*>(apvts_.getParameter(pid)))
+            *pi = v;
+    };
     if (id == "freedom")     setCfg("cfgstyle", cfg_musiccoca_from_freedom(value));
-    else if (id == "follow") setCfg("cfgnotes", cfg_notes_from_follow(value));
+    else if (id == "follow") {
+        setCfg("cfgnotes", cfg_notes_from_follow(value));
+        setCfg("hintdensity", value);
+        setCfg("hinthold", value);
+        setIntParam("unmask", (int)std::lround(8.0f * juce::jlimit(0.0f, 1.0f, value)));
+    }
     else if (id == "drums")  setCfg("cfgdrums", cfg_drums_from_toggle(value > 0.5f));
     macroWriting_.store(false);
 }
@@ -188,8 +218,23 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     const int nOut = buffer.getNumChannels();
     const int nIn = getTotalNumInputChannels();
 
-    // Live knob -> engine params.
-    runner_.apply_params(resolve_params(knobsFromParams()));
+    // Live knob -> engine params, with the cfg_notes bootstrap floor (see
+    // noteBootstrapFloor): user intent rules once the layer is established;
+    // until then the hints stay assertive enough to bring the piano into
+    // existence (and back, if it collapses). Applied unconditionally: without
+    // a plan there are no note tokens, so the floor is inert in pure-listening
+    // mode — except during defibrillation, when the worker injects the plan
+    // and this floor is exactly what drives the re-entry.
+    {
+        Knobs k = knobsFromParams();
+        EngineParams p = resolve_params(k);
+        p.cfg_notes = juce::jmax(p.cfg_notes, noteBootstrapFloor());
+        runner_.apply_params(p);
+        effCfgNotes_.store(p.cfg_notes);
+        effHintDensity_.store(k.hint_density);
+        effHintHold_.store(k.hint_hold);
+        effUnmask_.store(p.unmask_width);
+    }
 
     // Save dry input (host SR) before we overwrite the buffer.
     juce::AudioBuffer<float> dry(juce::jmax(1, juce::jmin(2, nIn)), nBlk);
@@ -201,7 +246,7 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
     const GridState grid = clock_.update(tr, hostSampleRate_);
     curBpm_.store(grid.bpm); curBeatsPerBar_.store(grid.beats_per_bar); playing_.store(grid.playing);
     uiBpm_.store((float)grid.bpm); uiPlaying_.store(grid.playing);
-    uiLocked_.store(grid.playing && runner_.has_plan());
+    uiLocked_.store(grid.playing && locked_.load());
 
     // Feed input into the capture ring (buffer still holds input here).
     if (nIn > 0)
@@ -227,6 +272,7 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
             // A pending Re-lock fires here, bar-aligned: force the re-prefill even
             // if the loop is unchanged. The capture window now ends on the boundary.
             if (relockPending_.exchange(false)) forceRelock_.store(true);
+            if (resetHistoryPending_.exchange(false)) forceReset_.store(true);
             // Drain the ring only on transport START (stale frames from the
             // stopped period). A routine clip-loop WRAP is a musical
             // continuation: the buffered frames are phase-correct mod loop, and
@@ -240,15 +286,15 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
 
     // Produce the AI layer at host SR into the first two output channels — but
     // ONLY while the host transport is playing AND we have locked onto the
-    // input at least once (captured + analyzed + prefilled -> plan present).
-    // Before the first lock the engine free-runs on the style prompt alone;
-    // that must never reach the output — a freshly opened plugin is silent.
-    // When muted we don't pull the ring, so the inference loop back-pressures
-    // and idles; the optional dry passthrough below still works for monitoring.
+    // input at least once (captured + analyzed + prefilled). Before the first
+    // lock the engine free-runs on the style prompt alone; that must never
+    // reach the output — a freshly opened plugin is silent. When muted we
+    // don't pull the ring, so the inference loop back-pressures and idles;
+    // the optional dry passthrough below still works for monitoring.
     float* outL = buffer.getWritePointer(0);
     float* outR = buffer.getWritePointer(juce::jmin(1, nOut - 1));
     const double ratio = 48000.0 / hostSampleRate_;
-    const bool locked = runner_.has_plan();
+    const bool locked = locked_.load();
 
     if (!grid.playing || !locked) {
         std::fill(outL, outL + nBlk, 0.0f);
@@ -308,6 +354,9 @@ Knobs PluginProcessor::knobsFromParams() const {
     k.cfg_musiccoca = apvts_.getRawParameterValue("cfgstyle")->load();
     k.cfg_notes     = apvts_.getRawParameterValue("cfgnotes")->load();
     k.cfg_drums     = apvts_.getRawParameterValue("cfgdrums")->load();
+    k.hint_density  = apvts_.getRawParameterValue("hintdensity")->load();
+    k.hint_hold     = apvts_.getRawParameterValue("hinthold")->load();
+    k.unmask_width  = (int)apvts_.getRawParameterValue("unmask")->load();
     k.user_key_tonic = (int)apvts_.getRawParameterValue("keytonic")->load();
     k.user_key_mode = apvts_.getRawParameterValue("keymajor")->load() > 0.5f ? Mode::Major : Mode::Minor;
     return k;  // register_lo/hi stay -1 (occupancy-aware auto)
@@ -331,6 +380,7 @@ void PluginProcessor::workerLoop() {
     auto lastPrefill = clock::now();
     bool havePrefilled = false;
     bool preArmed = false;
+    int deadLoops = 0;  // consecutive unhealthy-layer boundaries (defibrillator)
     std::vector<MidiEvent> lastPlanEvents;
     int lastPlanFrames = 0;
     std::vector<int> lastHarmonySig;
@@ -342,26 +392,32 @@ void PluginProcessor::workerLoop() {
     int acceptedTonic = -1; bool acceptedMajor = false;
     int pendingTonic = -1;  bool pendingMajor = false;
 
-    // Re-ground cadence: the model attends to ~500 frames (~20 s); the periodic
-    // refresher appends a few seconds of grounding, so refresh roughly every
-    // 12 s of free-running.
-    constexpr double kCtxMaxSec = 12.0;
-
     while (workerRun_.load()) {
+        const double refreshBars = apvts_.getRawParameterValue("contextrefresh")->load();
+        const double bpmNow = std::max(1.0, curBpm_.load());
+        const int beatsPerBarNow = juce::jmax(1, curBeatsPerBar_.load());
+        const double refreshSec = refreshBars > 0.0
+            ? refreshBars * beatsPerBarNow * 60.0 / bpmNow
+            : 0.0;
+        effContextRefreshBars_.store((float)refreshBars);
         // Pre-arm: when the next boundary is likely to re-ground, deepen the
         // ring target so generation builds enough audio to bridge the prefill.
-        // Headroom builds only at (1 - frame_ms/40ms) of realtime — measured
-        // ~0.15-0.25x on an M-Max — so start early; arming early just means
-        // the ring sits deeper for a while (conditioning latency, not output
-        // latency), while arming late means an audible gap at the re-ground.
+        // Headroom builds at the engine's measured surplus over realtime
+        // (1 - frame_ms/40, with a safety factor) — sized dynamically so the
+        // ring is only deep for the window that needs it (a deep ring delays
+        // knob/plan changes by its depth). Periodic re-grounds are refreshers;
+        // an armed Re-lock already pre-armed itself for a full prefill.
         const double ctxAge = std::chrono::duration<double>(clock::now() - lastPrefill).count();
         // (Not before the first lock: until then the output is muted, so the
         // first prefill's stall is inaudible and headroom would only delay it.)
-        if (havePrefilled && playing_.load() && !preArmed) {
-            const int headroom = prefillHeadroomFrames();
-            const double buildSec = headroom * 0.04 / 0.15 + 1.0;
-            if (ctxAge >= kCtxMaxSec - buildSec) {
-                runner_.set_buffer_target_frames(headroom);
+        if (refreshSec > 0.0 && havePrefilled && playing_.load() && !preArmed) {
+            const int headroom = prefillHeadroomFrames(false);
+            const float surplus = juce::jlimit(0.1f, 0.8f,
+                                               1.0f - runner_.last_frame_ms() / 40.0f) * 0.7f;
+            const double buildSec = headroom * 0.04 / surplus + 1.0;
+            if (ctxAge >= refreshSec - buildSec) {
+                runner_.set_buffer_target_frames(
+                    juce::jmax(runner_.buffer_target_frames(), headroom));
                 preArmed = true;
             }
         }
@@ -369,6 +425,7 @@ void PluginProcessor::workerLoop() {
         if (!captureReq_.exchange(false)) { std::this_thread::sleep_for(20ms); continue; }
         if (!runner_.ready()) continue;
         const bool force = forceRelock_.exchange(false);   // Re-lock button: always re-prefill
+        const bool resetHist = forceReset_.exchange(false);  // Reset-history: + factory wipe
 
         CapturedLoop c;
         if (!capture_.snapshot(c)) continue;
@@ -448,6 +505,49 @@ void PluginProcessor::workerLoop() {
         }
         lastHarmonySig = std::move(sig);
 
+        // Harmonic feedback: analyze what the MODEL played last loop and fold
+        // its reharmonizations into the hints (same-root color upgrades
+        // anywhere; substitutions on weak beats; key-fenced). Without this the
+        // hints reset to bass-derived chords every loop and yank the model
+        // back from any progression it starts — the opposite of "develops".
+        // The change-detection signature above deliberately uses the
+        // PRE-merge analysis, so the model's own ideas never read as an
+        // "input changed" re-ground trigger.
+        // `aiHealthy` doubles as the refresher circuit breaker below: only a
+        // pitched, audibly-playing layer may be gain-boosted back into the
+        // model's context. A degraded layer (underrun gaps, percussive
+        // collapse) boosted to input level would lock the degradation in —
+        // the input-only refresher is the recovery anchor instead. The bar is
+        // deliberately low (pitched OR moderately tonal): sparse smooth-jazz
+        // comping over a 10 s window must not be classed as garbage, or the
+        // breaker itself starves the layer.
+        bool aiHealthy = false;
+        if (havePrefilled) {
+            CapturedLoop aiLoop;
+            if (aiCapture_.snapshot(aiLoop) && aiLoop.valid && aiLoop.rms > 1.5e-3) {
+                AnalyzerConfig fbCfg = acfg;
+                fbCfg.key_lock_tonic = uiKeyTonic_.load();   // analyze in the accepted key
+                fbCfg.key_lock_major = uiKeyMajor_.load();
+                Analysis aiA = analyze_loop(aiLoop.mono48k.data(), aiLoop.frames48k,
+                                            48000.0, bpm, beatsPerBar, bars, fbCfg);
+                aiHealthy = aiA.level != HarmonyLevel::None || aiA.tonality > 0.4f;
+                if (aiHealthy) a = merge_harmonic_feedback(std::move(a), aiA);
+            }
+            // Smooth per-loop health -> the cfg_notes bootstrap floor decays
+            // over ~3 loops once the layer is established (and returns as
+            // quickly if it collapses).
+            aiHealth_.store(0.65f * aiHealth_.load() + 0.35f * (aiHealthy ? 1.0f : 0.0f));
+            // Defibrillator: ~2 consecutive dead loops -> inject the chord
+            // hints (even in pure-listening mode) until the layer returns.
+            if (aiHealthy) {
+                deadLoops = 0;
+                if (defib_.exchange(false))
+                    std::fprintf(stderr, "[mrt2] layer recovered; hints withdrawn\n");
+            } else if (++deadLoops >= 2 && !defib_.exchange(true)) {
+                std::fprintf(stderr, "[mrt2] layer dead %d loops; defibrillating\n", deadLoops);
+            }
+        }
+
         // Always rebuild the plan from THIS loop's analysis — but only swap it
         // in when it differs (a swap sweeps held notes off, so identical swaps
         // would blip the conditioning once per loop for nothing). The plan
@@ -460,41 +560,102 @@ void PluginProcessor::workerLoop() {
                         [](const MidiEvent& x, const MidiEvent& y) {
                             return x.frame == y.frame && x.pitch == y.pitch && x.on == y.on;
                         });
-        // The FIRST lock must not unmute the output (has_plan) until the
-        // grounded audio exists: prefill first, drop the pre-lock freestyle
-        // still in the ring, THEN swap in the plan. After that, plans swap
-        // immediately (cheap, seamless) and grounding follows.
+        // Note Guide OFF = the pure-listening experiment: no pianoroll
+        // conditioning at all. Steering is context re-grounding + blended
+        // style only. Everything above still runs (analysis feeds the UI and
+        // the layer-health circuit breaker); only the plan is withheld —
+        // EXCEPT while defibrillating: a dead layer gets the hints back (with
+        // the bootstrap floor driving them) until it re-establishes, because
+        // pure listening has no other re-entry path.
+        const bool noteGuide = apvts_.getRawParameterValue("noteguide")->load() > 0.5f;
+        const bool planActive = noteGuide || defib_.load();
+        if (!planActive && lastPlanFrames != 0) {
+            runner_.clear_plan();   // inference loop sweeps stale notes off
+            lastPlanEvents.clear();
+            lastPlanFrames = 0;
+        }
+
+        // The FIRST lock must not unmute the output until the grounded audio
+        // exists: prefill first, drop the pre-lock freestyle still in the
+        // ring, THEN mark locked. After that, plans swap immediately (cheap,
+        // seamless) and grounding follows.
         const bool firstGround = !havePrefilled;
-        if (!firstGround && planChanged) {
+        if (planActive && !firstGround && planChanged) {
             lastPlanEvents = plan.events;
             lastPlanFrames = plan.frames_per_loop;
             runner_.set_plan(plan);
         }
 
-        const bool fullGround = force || firstGround;
-        const bool needGround = fullGround || coarseChange || harmonicChange ||
-                                ctxAge >= kCtxMaxSec;
+        const bool fullGround = force || firstGround || resetHist;
+        const bool autoGround = refreshSec > 0.0;
+        const bool periodicRefresh = autoGround && ctxAge >= refreshSec;
+        const bool needGround = fullGround ||
+                                (autoGround && (coarseChange || harmonicChange || periodicRefresh));
         if (needGround) {
-            // First grounding / explicit Re-lock: full re-seed from the input
-            // alone (clean take). Everything else: a short REFRESHER of the
-            // input + our own layer appended to the model's live context —
-            // continuity is free (its own history stays in the KV cache) and
-            // the stall is roughly half of a full prefill.
-            std::vector<float> pre = buildPrefillAudio(c, !fullGround);
+            // First grounding / Re-lock / Reset-history: full re-seed from the
+            // input alone (clean take). Everything else: a short REFRESHER
+            // appended to the model's live context — continuity is free (its
+            // own history stays in the KV cache) and the stall is roughly half
+            // of a full prefill. The layer is mixed in only while healthy
+            // (circuit breaker — see aiHealthy above). Reset-history also
+            // factory-wipes the KV state first, so accumulated weirdness is
+            // gone rather than rolling out of the receptive field over ~20 s.
+            const float feedback = (!fullGround && aiHealthy)
+                ? apvts_.getRawParameterValue("contextfeedback")->load()
+                : 0.0f;
+            effContextFeedback_.store(feedback);
+            std::vector<float> pre = buildPrefillAudio(c, !fullGround, feedback);
             const int preFrames = (int)(pre.size() / 2);
             const bool ok = preFrames > 50 &&
-                (fullGround ? runner_.prefill(pre.data(), preFrames)
+                (fullGround ? runner_.prefill(pre.data(), preFrames, -1, -1, /*reset=*/resetHist)
                             : runner_.prefill(pre.data(), preFrames, 25, 25));
             if (ok) {
                 lastPrefill = clock::now();
                 havePrefilled = true;
+                (fullGround ? lastFullPrefillMs_ : lastRefreshPrefillMs_)
+                    .store(runner_.last_prefill_ms());
+                if (resetHist) {
+                    // Fresh slate: force the layer to bootstrap again (raise
+                    // the cfg_notes floor) and clear the defib state.
+                    aiHealth_.store(0.0f); deadLoops = 0; defib_.store(false);
+                }
                 if (firstGround) {
                     // Safe to act as the ring consumer here: the audio thread
-                    // is still muted (no plan yet) and not reading.
+                    // is still muted (not locked) and not reading.
                     runner_.reanchor();
-                    lastPlanEvents = plan.events;
-                    lastPlanFrames = plan.frames_per_loop;
-                    runner_.set_plan(plan);  // unmutes the output
+                    if (planActive) {
+                        lastPlanEvents = plan.events;
+                        lastPlanFrames = plan.frames_per_loop;
+                        runner_.set_plan(plan);
+                    }
+                    locked_.store(true);  // unmutes the output
+                }
+                // Refresh the style blend: the loop's own MusicCoCa latents
+                // mixed into the text prompt, so "jazz piano" leans toward
+                // THIS input's timbre/energy. 16 kHz mono, last <= 10 s
+                // (the audio encoder's traced window); crude 3:1 averaging
+                // decimation is fine for a global-style embedding. Async on
+                // the engine's MusicCoCa worker — no audio-thread cost.
+                // While defibrillating, drop the loop-latent share to zero:
+                // a context already collapsing toward the input must not have
+                // the STYLE pulled toward the input's timbre as well — pure
+                // text prompt until the layer is back.
+                const float blendW = defib_.load()
+                    ? 0.0f
+                    : apvts_.getRawParameterValue("styleblend")->load();
+                effStyleBlend_.store(blendW);
+                constexpr int kMaxStyleSamples = 160000;  // 10 s @ 16 kHz
+                const int n16 = juce::jmin(kMaxStyleSamples, c.frames48k / 3);
+                if (blendW <= 1.0e-5f) {
+                    runner_.set_style_audio(nullptr, 0, 0.0f);
+                } else if (n16 > 16000) {
+                    std::vector<float> mono16k((size_t)n16);
+                    const int start = c.frames48k - n16 * 3;  // most recent tail
+                    for (int i = 0; i < n16; ++i) {
+                        const size_t s = (size_t)(start + i * 3);
+                        mono16k[(size_t)i] = (c.mono48k[s] + c.mono48k[s + 1] + c.mono48k[s + 2]) / 3.0f;
+                    }
+                    runner_.set_style_audio(mono16k.data(), mono16k.size(), blendW);
                 }
             }
             preArmed = false;  // prefill() restored the buffer target
@@ -504,23 +665,25 @@ void PluginProcessor::workerLoop() {
 
 // Assemble grounding audio.
 //
-// Full grounding (mixOwnLayer=false): the input loop tiled to >= 8 s so the
+// Full grounding (refresher=false): the input loop tiled to >= 8 s so the
 // engine's symmetric trim still leaves a usable window for 1-2 bar loops.
 //
-// Refresher (mixOwnLayer=true): input summed with our own captured layer,
-// gain-corrected to the input's level — the loudness servo lives HERE, in the
-// context the model hears, not on the output. Since prefill APPENDS to the
-// live state, we only feed a ~3 s tail (plus 1 s pre/post-roll that the 25/25
-// trim discards; the post-roll wraps to the loop start so the kept window
-// ends exactly at the loop boundary with clean, non-padded tokens). Prefill
-// cost scales with the kept frames, so this stalls ~half as long as a full
-// grounding.
-std::vector<float> PluginProcessor::buildPrefillAudio(const CapturedLoop& in, bool mixOwnLayer) {
+// Refresher (refresher=true): a short tail appended to the live context.
+// Since prefill APPENDS to the state, ~2.4 s suffices (plus 1 s pre/post-roll
+// that the 25/25 trim discards; the post-roll wraps to the loop start so the
+// kept window ends exactly at the loop boundary with clean, non-padded
+// tokens). Prefill cost scales with the kept frames, so this stalls ~half as
+// long as a full grounding. With `ownLayerAmount > 0` the input is summed with
+// our own captured layer gain-corrected to the input's level — the loudness
+// servo lives HERE, in the context the model hears, not on the output. The
+// caller gates the amount on layer health so degradation is never boosted back in.
+std::vector<float> PluginProcessor::buildPrefillAudio(const CapturedLoop& in, bool refresher,
+                                                      float ownLayerAmount) {
     std::vector<float> loop = in.stereo48k;
     const int loopFrames = (int)(loop.size() / 2);
     if (loopFrames <= 0) return {};
 
-    if (!mixOwnLayer) {
+    if (!refresher) {
         constexpr int kMinPrefill = 8 * 48000;
         std::vector<float> pre;
         const int reps = juce::jmax(1, (kMinPrefill + loopFrames - 1) / loopFrames);
@@ -531,11 +694,13 @@ std::vector<float> PluginProcessor::buildPrefillAudio(const CapturedLoop& in, bo
     }
 
     CapturedLoop ai;
-    if (aiCapture_.snapshot(ai) && ai.valid && ai.rms > 1e-4) {
+    ownLayerAmount = juce::jlimit(0.0f, 1.0f, ownLayerAmount);
+    if (ownLayerAmount > 1.0e-5f && aiCapture_.snapshot(ai) && ai.valid && ai.rms > 1e-4) {
         const size_t n = std::min(loop.size(), ai.stereo48k.size());
         // Our layer should sit just under the input in the context mix;
         // boost-only (never duck a healthy layer), capped at +12 dB.
-        const float boost = (float)juce::jlimit(1.0, 4.0, 0.85 * in.rms / std::max(1e-4, ai.rms));
+        const float boost = ownLayerAmount *
+            (float)juce::jlimit(1.0, 4.0, 0.85 * in.rms / std::max(1e-4, ai.rms));
         float peak = 0.0f;
         for (size_t i = 0; i < n; ++i) {
             loop[i] += boost * ai.stereo48k[i];

@@ -58,6 +58,15 @@ public:
     void set_prompt(const std::string& text);
     void apply_params(const EngineParams& p);
 
+    // Blend the LOOP's own MusicCoCa embedding into the style at `weight`
+    // (0..1): style = (1-w)*text + w*loop-audio. This is the "capture the
+    // latents of the input and combine with the prompt" channel — global
+    // vibe/timbre only (MusicCoCa is time-invariant); harmony stays with the
+    // chord hints and the KV context. `mono16k` = 16 kHz mono samples, <= 10 s
+    // (the MusicCoCa audio encoder's traced input). Encoding is async on the
+    // engine's MusicCoCa worker. Pass n == 0 to clear back to text-only.
+    void set_style_audio(const float* mono16k, std::size_t n, float weight);
+
     // Chord-MIDI plan (lock-free swap) + the host phase anchor.
     void set_plan(const MidiPlan& plan);
     void clear_plan();
@@ -82,8 +91,14 @@ public:
     // control which part of the encoded clip lands in the context — prefill
     // cost is dominated by the per-frame transformer loop over the KEPT frames
     // (~the generation frame cost each), so shorter kept windows stall less.
+    //
+    // reset_to_factory: wipe the live KV state to the model's factory initial
+    // BEFORE seeding from this clip. Normal (append) prefill leaves the prior
+    // ~20 s of history in the receptive field; resetting first gives a truly
+    // clean slate grounded only on this clip — the "Reset history" path.
     bool prefill(const float* stereo48k, int frames,
-                 int trim_front = -1, int trim_back = -1);
+                 int trim_front = -1, int trim_back = -1,
+                 bool reset_to_factory = false);
 
     // Drain the ring (re-anchor at a loop seam / transport jump).
     void reanchor();
@@ -138,6 +153,8 @@ private:
     std::atomic<std::uint64_t> dropped_{0};
 
     std::string pending_prompt_;
+    bool  style_audio_active_ = false;   // guarded by prompt_mutex_
+    float style_audio_weight_ = 0.25f;   // guarded by prompt_mutex_
     std::mutex prompt_mutex_;
     std::mutex lifecycle_mutex_;
 };

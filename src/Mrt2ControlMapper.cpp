@@ -23,7 +23,7 @@ EngineParams resolve_params(const Knobs& k) {
     //   low  (0)   -> cfg_notes 2.5, unmask 0  (loose, flowing, more bass)
     //   def  (0.4) -> cfg_notes 4.1, unmask 3  (locked + flowing piano)
     //   high (1)   -> cfg_notes 6.5, unmask 8  (tightly locked)
-    p.unmask_width  = (int)std::lround(8 * fh);
+    p.unmask_width  = k.unmask_width >= 0 ? k.unmask_width : (int)std::lround(8 * fh);
     p.seed_rotation = k.variation;
     p.drumless      = !k.drums;
     p.onset_mode    = 1;  // exact beat-frame onsets
@@ -43,7 +43,49 @@ EngineParams resolve_params(const Knobs& k) {
 }
 
 std::vector<int> voice_chord(const Chord& chord, int lo, int hi) {
+    return voice_pcs(chord.pitch_classes(), lo, hi);
+}
+
+std::vector<int> pcs_with_seventh(const Chord& chord, const Key& key) {
     std::vector<int> pcs = chord.pitch_classes();
+    if (chord.root < 0 || pcs.empty()) return pcs;
+    // Major on the key's dominant -> b7 (dom7); other majors -> maj7;
+    // minor / dim -> b7 (m7 / m7b5).
+    const bool dominant = chord.quality == Quality::Maj &&
+                          chord.root == (key.tonic + 7) % 12;
+    const int interval = (chord.quality == Quality::Maj && !dominant) ? 11 : 10;
+    const int seventh = (chord.root + interval) % 12;
+    if (std::find(pcs.begin(), pcs.end(), seventh) == pcs.end())
+        pcs.push_back(seventh);
+    return pcs;
+}
+
+Analysis merge_harmonic_feedback(Analysis base, const Analysis& ai, float conf_floor) {
+    if (base.level == HarmonyLevel::None) return base;
+    if (ai.beats.size() != base.beats.size()) return base;
+    static const int kMajorScale[7] = {0, 2, 4, 5, 7, 9, 11};
+    static const int kMinorScale[7] = {0, 2, 3, 5, 7, 8, 10};
+    const int* scale = base.key.mode == Mode::Major ? kMajorScale : kMinorScale;
+    auto in_key = [&](int pc) {
+        for (int i = 0; i < 7; ++i)
+            if (((base.key.tonic + scale[i]) % 12) == pc) return true;
+        return false;
+    };
+    for (size_t b = 0; b < base.beats.size(); ++b) {
+        const Chord& cand = ai.beats[b];
+        if (cand.root < 0 || cand.confidence < conf_floor) continue;
+        if (!in_key(cand.root)) continue;
+        const bool downbeat = base.beats_per_bar > 0 && (int)(b % (size_t)base.beats_per_bar) == 0;
+        if (cand.root == base.beats[b].root) {
+            base.beats[b].quality = cand.quality;   // color upgrade, same floor
+        } else if (!downbeat) {
+            base.beats[b] = cand;                   // passing / substitute chord
+        }
+    }
+    return base;
+}
+
+std::vector<int> voice_pcs(const std::vector<int>& pcs, int lo, int hi) {
     if (pcs.empty()) return {};
     // Place each pitch class at the lowest octave >= lo, then push any that are
     // below the previous voice up an octave so the chord reads ascending and
@@ -123,17 +165,44 @@ MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double f
             bool bar_start = (a.beats_per_bar > 0) && (b % a.beats_per_bar == 0);
             voicings[b] = bar_start ? voice_chord(user_tonic, lo, hi)
                                     : voicings[b > 0 ? b - 1 : 0];  // hold within the bar
+        } else if (k.seventh_chords) {
+            voicings[b] = voice_pcs(pcs_with_seventh(a.beats[b], a.key), lo, hi);
         } else {
             voicings[b] = voice_chord(a.beats[b], lo, hi);
         }
     }
 
-    // Pulse density follows the Follow knob: every beat when tightly locked,
-    // sparser (half notes / chord-changes-only) as the user lets go. Held
-    // notes between pulses become weak "continuation" tokens, so the model
-    // keeps the harmony but invents its own rhythm.
-    const int pulse = rearticulation_period_from_follow(k.follow_input);
+    // Pulse density + hold time follow the Follow knob (see the mapper header:
+    // the pianoroll is teacher-forcing, so sustained tones read as a literal
+    // block-chord score). Tight: sustain to the next pulse. Looser: onset on
+    // the pulse, then release back to MASKED after `hold` frames so the model
+    // is free to voice/sustain/run lines between the hints.
+    const float hintDensity = k.hint_density > Knobs::kCfgUnset ? k.hint_density : k.follow_input;
+    const float hintHold = k.hint_hold > Knobs::kCfgUnset ? k.hint_hold : k.follow_input;
+    const int pulse = rearticulation_period_from_hint_density(hintDensity);
+    const int hold = atonal ? 0 : hold_frames_from_hint_hold(hintHold, plan.frames_per_beat, pulse);
 
+    if (hold > 0) {
+        // Hint mode: short on/off pairs, no carried sustain. Fire on the pulse
+        // grid and on any chord change; beat 0 of each iteration always fires
+        // (the loop's tempo anchor).
+        std::vector<int> prev;  // previous beat's voicing, for change detection
+        for (int it = 0; it < iterations; ++it) {
+            const int it_base = it * plan.frames_per_iteration;
+            for (int b = 0; b < total_beats; ++b) {
+                int frame = it_base + (int)std::llround(b * plan.frames_per_beat);
+                std::vector<int> next = invert_voicing(voicings[b], it, lo, hi);
+                const bool fire = b == 0 || (pulse > 0 && b % pulse == 0) || next != prev;
+                if (fire) {
+                    for (int p : next) {
+                        plan.events.push_back({frame, p, true});
+                        plan.events.push_back({(frame + hold) % plan.frames_per_loop, p, false});
+                    }
+                }
+                prev = std::move(next);
+            }
+        }
+    } else {
     std::vector<int> held;  // currently sounding pitches, carried across iterations
     for (int it = 0; it < iterations; ++it) {
         const int it_base = it * plan.frames_per_iteration;
@@ -170,6 +239,7 @@ MidiPlan build_midi_plan(const Analysis& a, double bpm, const Knobs& k, double f
             if (std::find(first.begin(), first.end(), p) == first.end())
                 plan.events.push_back({0, p, false});
     }
+    }  // hold == 0 (sustain mode)
 
     // Stable order: by frame, note-offs before note-ons at the same frame.
     std::stable_sort(plan.events.begin(), plan.events.end(),

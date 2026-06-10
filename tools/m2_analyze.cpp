@@ -1,5 +1,6 @@
 // M2 — Key + Chord analyzer validation (BRIEF §9.3).
-//   m2_analyze <loop.wav> --bpm B [--beats-per-bar 4] [--bars N] [--expect "Am Dm E Am"]
+//   m2_analyze <loop.wav> --bpm B [--beats-per-bar 4] [--bars N]
+//              [--key-tonic 0..11 --key-major 0|1] [--expect "Am Dm E Am"]
 
 #include "../src/KeyChordAnalyzer.h"
 #include "../src/Mrt2ControlMapper.h"
@@ -15,10 +16,13 @@ int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: m2_analyze <loop.wav> --bpm B [--bars N] [--beats-per-bar 4] [--expect \"Am Dm E Am\"]\n"); return 1; }
     std::string path = argv[1], expect;
     double bpm = 120; int bpb = 4, bars = 0;
+    AnalyzerConfig cfg;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a == "--bpm") bpm = std::stod(argv[++i]);
         else if (a == "--beats-per-bar") bpb = std::stoi(argv[++i]);
         else if (a == "--bars") bars = std::stoi(argv[++i]);
+        else if (a == "--key-tonic") cfg.key_lock_tonic = std::stoi(argv[++i]);
+        else if (a == "--key-major") cfg.key_lock_major = std::stoi(argv[++i]) != 0;
         else if (a == "--expect") expect = argv[++i];
     }
     WavData wav;
@@ -28,7 +32,7 @@ int main(int argc, char** argv) {
     std::printf("[m2] %s  %.2fs @ %dHz  grid: %.0f BPM, %d/4, %d bars\n",
                 path.c_str(), dur, wav.sample_rate, bpm, bpb, bars);
 
-    Analysis a = analyze_loop(wav.mono.data(), (int)wav.mono.size(), wav.sample_rate, bpm, bpb, bars);
+    Analysis a = analyze_loop(wav.mono.data(), (int)wav.mono.size(), wav.sample_rate, bpm, bpb, bars, cfg);
 
     const char* lvl = a.level == HarmonyLevel::Chords ? "Chords"
                     : a.level == HarmonyLevel::KeyScale ? "KeyScale" : "None";

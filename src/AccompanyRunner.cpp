@@ -17,8 +17,12 @@ using magentart::core::kFrameSamples;
 AccompanyRunner::AccompanyRunner() = default;
 
 AccompanyRunner::~AccompanyRunner() {
-    stop_inference();
+    // Join the loader FIRST: it may not have reached start_inference() yet,
+    // and stopping inference before it starts would leave the loader free to
+    // spawn the inference thread into an engine that is being destroyed
+    // (host removes the plugin while the model is still loading).
     if (loader_.joinable()) loader_.join();
+    stop_inference();
 }
 
 bool AccompanyRunner::has_plan() const {
@@ -200,8 +204,38 @@ void AccompanyRunner::set_buffer_target_frames(int frames) {
 }
 
 void AccompanyRunner::set_prompt(const std::string& text) {
-    { std::lock_guard<std::mutex> lk(prompt_mutex_); pending_prompt_ = text; }
-    if (ready()) engine_.set_text_prompt(text);
+    bool blended; float w;
+    {
+        std::lock_guard<std::mutex> lk(prompt_mutex_);
+        pending_prompt_ = text;
+        blended = style_audio_active_;
+        w = style_audio_weight_;
+    }
+    if (!ready()) return;
+    // Slot 0 = the text prompt; slot 1 = the loop's audio embedding (its text
+    // entry is ignored while the slot holds audio). Weights blend the slots'
+    // embeddings before quantization, inside the engine's MusicCoCa worker.
+    if (blended) engine_.set_text_prompts({text, ""}, {1.0f - w, w});
+    else engine_.set_text_prompt(text);
+}
+
+void AccompanyRunner::set_style_audio(const float* mono16k, std::size_t n, float weight) {
+    if (!ready()) return;
+    std::string text; float w;
+    {
+        std::lock_guard<std::mutex> lk(prompt_mutex_);
+        style_audio_active_ = (mono16k != nullptr && n > 0);
+        style_audio_weight_ = std::clamp(weight, 0.0f, 1.0f);
+        text = pending_prompt_;
+        w = style_audio_weight_;
+    }
+    if (mono16k && n > 0) {
+        engine_.set_audio_prompt_samples(1, "loop", mono16k, n);
+        engine_.set_text_prompts({text, ""}, {1.0f - w, w});  // re-blend with the new clip
+    } else {
+        engine_.set_audio_prompt_samples(1, "", nullptr, 0);  // clear the slot
+        engine_.set_text_prompt(text);
+    }
 }
 
 void AccompanyRunner::apply_params(const EngineParams& p) {
@@ -247,9 +281,13 @@ void AccompanyRunner::note_on(int pitch) { if (ready()) engine_.set_note_on(pitc
 void AccompanyRunner::note_off(int pitch) { if (ready()) engine_.set_note_off(pitch); }
 
 bool AccompanyRunner::prefill(const float* stereo48k, int frames,
-                              int trim_front, int trim_back) {
+                              int trim_front, int trim_back, bool reset_to_factory) {
     if (!ready() || frames <= 0) return false;
     stop_inference();
+    // Wipe accumulated KV history first when asked, so this clip becomes the
+    // ONLY thing in the context (Reset history). prefill_state then appends to
+    // the factory state instead of the weird one we just discarded.
+    if (reset_to_factory) engine_.reset_to_factory();
     // We own the loop, so we can trim loop-length-aware (engine flag #4): a short
     // loop keeps a smaller trim than RealtimeRunner's fixed 25/25.
     const int trim = std::min(25, std::max(0, frames / 1920 / 2 - 1));

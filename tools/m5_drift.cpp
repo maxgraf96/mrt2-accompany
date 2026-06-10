@@ -8,12 +8,17 @@
 //
 //   m5_drift <loop.wav> [--bpm 120] [--bars 4] [--seconds 90] [--block 512]
 //            [--prompt "jazz piano"] [--out m5_out.wav]
+//            [--style-blend F] [--context-feedback F] [--context-refresh BARS]
+//            [--cfg-style F] [--cfg-notes F] [--hint-density F]
+//            [--hint-hold F] [--unmask N] [--note-guide 0|1]
+//            [--key-tonic 0..11] [--key-major 0|1] [--key-lock 0|1]
 
 #include "../src/PluginProcessor.h"
 #include "wav_io.h"
 
 #include <juce_events/juce_events.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <thread>
@@ -37,6 +42,10 @@ int main(int argc, char** argv) {
     std::string loop = argv[1], prompt = "jazz piano", out = "m5_out.wav";
     double bpm = 120; int bars = 4, seconds = 90, block = 512;
     double follow = -1, freedom = -1;   // <0 = leave the parameter default
+    double reset_at = -1;               // seconds: fire Reset history once
+    double style_blend = -1, context_feedback = -1, context_refresh = -1;
+    double cfg_style = -1000, cfg_notes = -1000, hint_density = -1, hint_hold = -1;
+    int unmask = -1, note_guide = -1, key_tonic = -1, key_major = -1, key_lock = -1;
     for (int i = 2; i < argc; ++i) { std::string a = argv[i];
         if (a=="--bpm") bpm=std::stod(argv[++i]);
         else if (a=="--bars") bars=std::stoi(argv[++i]);
@@ -46,12 +55,37 @@ int main(int argc, char** argv) {
         else if (a=="--out") out=argv[++i];
         else if (a=="--follow") follow=std::stod(argv[++i]);
         else if (a=="--freedom") freedom=std::stod(argv[++i]);
+        else if (a=="--reset-at") reset_at=std::stod(argv[++i]);
+        else if (a=="--style-blend") style_blend=std::stod(argv[++i]);
+        else if (a=="--context-feedback") context_feedback=std::stod(argv[++i]);
+        else if (a=="--context-refresh") context_refresh=std::stod(argv[++i]);
+        else if (a=="--cfg-style") cfg_style=std::stod(argv[++i]);
+        else if (a=="--cfg-notes") cfg_notes=std::stod(argv[++i]);
+        else if (a=="--hint-density") hint_density=std::stod(argv[++i]);
+        else if (a=="--hint-hold") hint_hold=std::stod(argv[++i]);
+        else if (a=="--unmask") unmask=std::stoi(argv[++i]);
+        else if (a=="--note-guide") note_guide=std::stoi(argv[++i]);
+        else if (a=="--key-tonic") key_tonic=std::stoi(argv[++i]);
+        else if (a=="--key-major") key_major=std::stoi(argv[++i]);
+        else if (a=="--key-lock") key_lock=std::stoi(argv[++i]);
     }
 
     juce::ScopedJuceInitialiser_GUI juceInit;  // MessageManager for APVTS/leak detector
 
     WavData in;
     if (!read_wav(loop, in)) { std::fprintf(stderr, "[m5] read %s failed\n", loop.c_str()); return 1; }
+    if (in.sample_rate != 48000) {  // linear resample (offline harness path)
+        const double r = in.sample_rate / 48000.0;
+        const int n = (int)(in.interleaved.size() / 2), m = (int)(n / r);
+        std::vector<float> rs((size_t)m * 2);
+        for (int i = 0; i < m; ++i) {
+            double s = i * r; int s0 = (int)s; double f = s - s0;
+            int s1 = std::min(s0 + 1, n - 1);
+            for (int c = 0; c < 2; ++c)
+                rs[(size_t)i*2+c] = (float)(in.interleaved[(size_t)s0*2+c]*(1-f) + in.interleaved[(size_t)s1*2+c]*f);
+        }
+        in.interleaved.swap(rs); in.sample_rate = 48000;
+    }
     const int inFrames = (int)(in.interleaved.size() / 2);
     std::printf("[m5] input loop %s: %.2fs @%dHz  grid %.0f BPM / %d bars\n",
                 loop.c_str(), inFrames / (double)in.sample_rate, in.sample_rate, bpm, bars);
@@ -64,6 +98,22 @@ int main(int argc, char** argv) {
     proc.apvts().getParameter("drymix")->setValueNotifyingHost(0.0f);  // capture AI only
     if (follow >= 0)  proc.apvts().getParameter("follow")->setValueNotifyingHost((float)follow);
     if (freedom >= 0) proc.apvts().getParameter("freedom")->setValueNotifyingHost((float)freedom);
+    auto setFloat = [&](const char* pid, double raw, double lo, double hi) {
+        raw = std::clamp(raw, lo, hi);
+        proc.apvts().getParameter(pid)->setValueNotifyingHost((float)((raw - lo) / (hi - lo)));
+    };
+    if (style_blend >= 0)       setFloat("styleblend", style_blend, 0.0, 0.1);
+    if (context_feedback >= 0)  setFloat("contextfeedback", context_feedback, 0.0, 1.0);
+    if (context_refresh >= 0)   setFloat("contextrefresh", context_refresh, 0.0, 16.0);
+    if (cfg_style > -999)       setFloat("cfgstyle", cfg_style, 0.0, 7.0);
+    if (cfg_notes > -999)       setFloat("cfgnotes", cfg_notes, -1.0, 7.0);
+    if (hint_density >= 0)      setFloat("hintdensity", hint_density, 0.0, 1.0);
+    if (hint_hold >= 0)         setFloat("hinthold", hint_hold, 0.0, 1.0);
+    if (unmask >= 0)            setFloat("unmask", unmask, 0.0, 8.0);
+    if (note_guide >= 0)        proc.apvts().getParameter("noteguide")->setValueNotifyingHost(note_guide ? 1.0f : 0.0f);
+    if (key_tonic >= 0)         setFloat("keytonic", key_tonic, 0.0, 11.0);
+    if (key_major >= 0)         proc.apvts().getParameter("keymajor")->setValueNotifyingHost(key_major ? 1.0f : 0.0f);
+    if (key_lock >= 0)          proc.apvts().getParameter("keylock")->setValueNotifyingHost(key_lock ? 1.0f : 0.0f);
     proc.setPlayConfigDetails(2, 2, SR, block);
     proc.prepareToPlay(SR, block);
 
@@ -90,6 +140,10 @@ int main(int argc, char** argv) {
             buf.setSample(1, i, in.interleaved[(size_t)s * 2 + 1]);
         }
         inPos += block;
+        if (reset_at >= 0 && b * block / SR >= reset_at) {
+            std::printf("[m5] firing Reset history at %.1fs\n", b * block / SR);
+            proc.resetHistory(); reset_at = -1;  // once
+        }
         proc.processBlock(buf, midi);
         for (int i = 0; i < block; ++i) { rec.push_back(buf.getSample(0, i)); rec.push_back(buf.getSample(1, i)); }
 

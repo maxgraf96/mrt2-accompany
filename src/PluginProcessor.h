@@ -59,6 +59,13 @@ public:
     bool  uiKeyMajor() const { return uiKeyMajor_.load(); }
     int   uiLevel() const { return uiLevel_.load(); }          // HarmonyLevel; -1 none
     bool  uiLocked() const { return uiLocked_.load(); }
+    float uiEffectiveStyleBlend() const { return effStyleBlend_.load(); }
+    float uiEffectiveContextFeedback() const { return effContextFeedback_.load(); }
+    float uiEffectiveContextRefreshBars() const { return effContextRefreshBars_.load(); }
+    float uiEffectiveCfgNotes() const { return effCfgNotes_.load(); }
+    float uiEffectiveHintDensity() const { return effHintDensity_.load(); }
+    float uiEffectiveHintHold() const { return effHintHold_.load(); }
+    int   uiEffectiveUnmask() const { return effUnmask_.load(); }
 
     // First-run asset download state for the UI.
     enum class AssetState { Checking, Ready, NeedsDownload, Downloading, Failed };
@@ -73,12 +80,27 @@ public:
     // boundary so the captured window is bar-aligned (avoids rotating the
     // chord-to-beat mapping vs the host grid). processBlock promotes this to a
     // forced capture when it next crosses a boundary. Pre-arm ring headroom now
-    // so the prefill stall at that boundary is bridged without an audio gap.
+    // so the prefill stall at that boundary is bridged without an audio gap —
+    // sized for a FULL prefill (Re-lock re-seeds from scratch, ~2x a refresher;
+    // sizing it from whatever ran last caused ~half the stall to gap through).
     void relock() {
         relockPending_.store(true);
-        runner_.set_buffer_target_frames(prefillHeadroomFrames());
+        runner_.set_buffer_target_frames(
+            juce::jmax(runner_.buffer_target_frames(), prefillHeadroomFrames(true)));
     }
     bool relockPending() const { return relockPending_.load(); }
+
+    // Reset history: wipe the accumulated KV context to factory and re-ground
+    // freshly from the current input loop, to escape weird/stuck generation
+    // during playback. Like Re-lock, deferred to the next loop boundary (the
+    // capture window must be bar-aligned) and pre-armed so the longer
+    // full-prefill stall is bridged without a gap.
+    void resetHistory() {
+        resetHistoryPending_.store(true);
+        runner_.set_buffer_target_frames(
+            juce::jmax(runner_.buffer_target_frames(), prefillHeadroomFrames(true)));
+    }
+    bool resetHistoryPending() const { return resetHistoryPending_.load(); }
     // Copy the captured-loop waveform peaks for display. Returns the count.
     int  copyWaveform(std::vector<float>& dest) const {
         juce::SpinLock::ScopedLockType lk(waveLock_);
@@ -101,17 +123,54 @@ private:
     void workerLoop();                              // background analyze + prefill
 
     // Ring headroom (25 fps frames) that bridges a prefill stall, sized from
-    // the last measured prefill duration (generation refills at ~1.5-2x).
-    // Kept tight: whatever headroom the prefill doesn't consume plays back as
-    // pre-prefill audio afterwards, delaying the refreshed context.
-    int prefillHeadroomFrames() const {
-        const float ms = runner_.last_prefill_ms();
+    // the measured duration of the matching prefill TYPE (a full re-seed runs
+    // ~2x a refresher). Kept tight: whatever headroom the prefill doesn't
+    // consume plays back as pre-prefill audio afterwards, delaying the
+    // refreshed context.
+    int prefillHeadroomFrames(bool fullGround) const {
+        const float ms = (fullGround ? lastFullPrefillMs_ : lastRefreshPrefillMs_).load();
         const int frames = (int)(ms / 40.0f * 1.15f) + 8;
         return juce::jlimit(25, 240, frames);
     }
-    // Prefill audio for (re-)grounding: input loop alone, or the input + our
-    // own recent layer (gain-corrected), tiled to the minimum prefill length.
-    std::vector<float> buildPrefillAudio(const CapturedLoop& in, bool mixOwnLayer);
+    // Grounding audio. Full ground: the input loop tiled to the minimum
+    // prefill length. Refresher: a short tail appended to the live context,
+    // mixed with our own captured layer (gain-corrected) only when
+    // `mixOwnLayer` — the caller gates that on the layer being HEALTHY, so a
+    // degraded layer (gaps, percussive collapse) is never boosted back into
+    // the model's context; the input-only refresher is the recovery anchor.
+    std::vector<float> buildPrefillAudio(const CapturedLoop& in, bool refresher,
+                                         float ownLayerAmount);
+
+    // Measured prefill durations by type (ms), pessimistic until first run.
+    std::atomic<float> lastFullPrefillMs_{4500.0f};
+    std::atomic<float> lastRefreshPrefillMs_{2400.0f};
+
+public:
+    // How established the AI layer is in the model's context (0..1, smoothed
+    // per loop from the worker's layer-health analysis). Drives the cfg_notes
+    // BOOTSTRAP FLOOR: the notes-blind half of the CFG blend can only contain
+    // piano once piano exists in the KV context, so low user cfg_notes on a
+    // fresh lock starves the layer into silence ("piano disappears below 1").
+    // The floor keeps the hints assertive until the layer is established,
+    // then decays to the user's setting; if the layer thins out, it returns.
+    float aiHealth() const { return aiHealth_.load(); }
+    float noteBootstrapFloor() const { return 2.5f * (1.0f - aiHealth_.load()); }
+
+    // Recovery ("defibrillator") active: the layer has been dead/degraded for
+    // consecutive loops, so the chord hints + bootstrap floor are temporarily
+    // injected EVEN IN pure-listening mode until it re-establishes. Without
+    // this, no-guide mode has no re-entry path: a silent layer makes the
+    // refreshers input-only, the fresh context reads as "the piano stopped",
+    // and silence locks in.
+    bool recovering() const { return defib_.load(); }
+
+private:
+    std::atomic<float> aiHealth_{0.0f};
+    std::atomic<bool> defib_{false};
+    // True once the first capture->prefill grounding has completed. Gates the
+    // output (silent until locked). Deliberately NOT runner_.has_plan(): with
+    // Note Guide off there is never a plan, but the lock is just as real.
+    std::atomic<bool> locked_{false};
 
     std::atomic<bool> loadStarted_{false};
     std::atomic<AssetState> assetState_{AssetState::Checking};
@@ -124,8 +183,17 @@ private:
     std::atomic<bool> uiKeyMajor_{false};
     std::atomic<int> uiLevel_{-1};
     std::atomic<bool> uiLocked_{false};
+    std::atomic<float> effStyleBlend_{0.03f};
+    std::atomic<float> effContextFeedback_{1.0f};
+    std::atomic<float> effContextRefreshBars_{4.0f};
+    std::atomic<float> effCfgNotes_{2.0f};
+    std::atomic<float> effHintDensity_{0.4f};
+    std::atomic<float> effHintHold_{0.4f};
+    std::atomic<int> effUnmask_{3};
     std::atomic<bool> forceRelock_{false};     // boundary -> worker: force re-prefill
     std::atomic<bool> relockPending_{false};   // Re-lock button: armed, fires at next boundary
+    std::atomic<bool> forceReset_{false};      // boundary -> worker: factory-reset + re-prefill
+    std::atomic<bool> resetHistoryPending_{false};  // Reset-history button: armed
     mutable juce::SpinLock waveLock_;
     std::vector<float> wavePeaks_;   // captured-loop waveform peaks (worker-set)
 

@@ -47,11 +47,12 @@ int main() {
     for (int f : onset_frames) { aligned &= (std::abs(f - (int)std::llround(b * 12.5)) <= 1); ++b; }
     CHECK(aligned, "each onset within 1 frame of its beat");
 
-    // 3) Pitch-class correctness for beat 0 (Am = {A,C,E} = {9,0,4}).
+    // 3) Pitch-class correctness for beat 0: 7th voicings are on by default,
+    //    so Am in A minor reads Am7 = {A,C,E,G} = {9,0,4,7}.
     std::set<int> pcs0;
     for (auto& e : plan.events) if (e.on && e.frame == 0) pcs0.insert(((e.pitch % 12) + 12) % 12);
-    std::set<int> expect_am = {9, 0, 4};
-    CHECK(pcs0 == expect_am, "beat 0 onsets spell Am {A,C,E}");
+    std::set<int> expect_am7 = {9, 0, 4, 7};
+    CHECK(pcs0 == expect_am7, "beat 0 onsets spell Am7 {A,C,E,G}");
 
     // 4) Chord change at bar 2 (frame ~50): a Dm pitch-class (D=2) appears that
     //    is not in Am, and at least one Am-only tone is released.
@@ -146,7 +147,7 @@ int main() {
 
     // 8b) Follow-driven pulse density: at follow=0 the plan onsets ONLY at
     //     chord changes (free rhythm, harmony as a whisper); at follow=1 it
-    //     pulses every beat (tight lock). Default macro floor drops to ~1.
+    //     pulses every beat (tight lock). Default macro maps to cfg_notes 2.
     {
         Knobs loose{0.5f, 0.0f, false, 0, 55, 79};
         MidiPlan lp = build_midi_plan(a, 120.0, loose);
@@ -160,9 +161,120 @@ int main() {
         MidiPlan mp = build_midi_plan(a, 120.0, mid);
         std::set<int> mof; for (auto& e : mp.events) if (e.on) mof.insert(e.frame);
         CHECK((int)mof.size() == 8, "follow=0.4 -> half-note pulse (8 onsets)");
-        CHECK(cfg_notes_from_follow(0.0f) <= 1.01f, "follow=0 -> cfg_notes floor ~1.0");
-        CHECK(std::abs(cfg_notes_from_follow(0.4f) - 4.0f) < 0.2f,
-              "follow=0.4 stays at the tuned ~4.0 anchor");
+        // Below the tight tier the plan is HINTS, not a score: every onset is
+        // released `hold` frames later (back to masked = model-free), instead
+        // of sustaining to the next pulse.
+        const int hold = hold_frames_from_follow(0.4f, mp.frames_per_beat);
+        bool released = true;
+        for (auto& e : mp.events) if (e.on) {
+            bool found = false;
+            for (auto& o : mp.events)
+                if (!o.on && o.pitch == e.pitch &&
+                    o.frame == (e.frame + hold) % mp.frames_per_loop) found = true;
+            released &= found;
+        }
+        CHECK(released, "follow=0.4 onsets release after the hold (hint mode)");
+        CHECK(hold > 0 && hold < (int)(2 * mp.frames_per_beat),
+              "0.4 hold is shorter than the pulse gap");
+        CHECK(hold_frames_from_follow(0.0f, mp.frames_per_beat) == 3,
+              "follow=0 -> ~120 ms hint");
+        CHECK(hold_frames_from_follow(0.8f, mp.frames_per_beat) == 0,
+              "tight follow sustains (score mode)");
+        CHECK(std::abs(cfg_notes_from_follow(0.0f) - (-1.0f)) < 0.01f,
+              "follow=0 -> cfg_notes -1 (notes truly ignored)");
+        CHECK(std::abs(cfg_notes_from_follow(0.4f) - 2.0f) < 0.01f,
+              "follow=0.4 -> cfg_notes 2.0 (gentle amplification)");
+        CHECK(std::abs(cfg_notes_from_follow(1.0f) - 6.5f) < 0.01f,
+              "follow=1 -> cfg_notes 6.5");
+    }
+
+    // 8c) Channel Lab independence: CFG Notes, MIDI hint density/hold, and
+    //     unmask width can be varied separately instead of all following the
+    //     Follow macro.
+    {
+        Knobs denseBlind{0.5f, 0.0f, false, 0, 55, 79};
+        denseBlind.cfg_notes = -1.0f;
+        denseBlind.hint_density = 1.0f;
+        denseBlind.hint_hold = 0.0f;
+        denseBlind.unmask_width = 0;
+        EngineParams ep = resolve_params(denseBlind);
+        MidiPlan p = build_midi_plan(a, 120.0, denseBlind);
+        std::set<int> onf; for (auto& e : p.events) if (e.on) onf.insert(e.frame);
+        CHECK(std::abs(ep.cfg_notes - (-1.0f)) < 0.01f, "cfg_notes override can stay notes-blind");
+        CHECK(ep.unmask_width == 0, "unmask override can stay narrow");
+        CHECK((int)onf.size() == 16, "hint_density override can still pulse every beat");
+        bool shortRelease = true;
+        for (auto& e : p.events) if (e.on) {
+            bool found = false;
+            for (auto& o : p.events)
+                if (!o.on && o.pitch == e.pitch && o.frame == (e.frame + 3) % p.frames_per_loop)
+                    found = true;
+            shortRelease &= found;
+        }
+        CHECK(shortRelease, "hint_hold override can force short hints");
+
+        Knobs sparseLocked{0.5f, 1.0f, false, 0, 55, 79};
+        sparseLocked.cfg_notes = 6.5f;
+        sparseLocked.hint_density = 0.0f;
+        sparseLocked.hint_hold = 0.0f;
+        sparseLocked.unmask_width = 8;
+        ep = resolve_params(sparseLocked);
+        p = build_midi_plan(a, 120.0, sparseLocked);
+        onf.clear(); for (auto& e : p.events) if (e.on) onf.insert(e.frame);
+        CHECK(std::abs(ep.cfg_notes - 6.5f) < 0.01f, "cfg_notes can stay strongly guided");
+        CHECK(ep.unmask_width == 8, "unmask can stay wide");
+        CHECK((int)onf.size() == 4, "hint_density can still emit chord-change-only hints");
+    }
+
+    // 8d) Diatonic 7ths: m7 on minor, dom7 on the key's V, maj7 elsewhere.
+    {
+        Key am; am.tonic = 9; am.mode = Mode::Minor;
+        auto pcs = [](std::vector<int> v) { return std::set<int>(v.begin(), v.end()); };
+        CHECK(pcs(pcs_with_seventh(mk(9, Quality::Min), am)) == std::set<int>({9, 0, 4, 7}),
+              "Am in A minor -> Am7 (adds G)");
+        CHECK(pcs(pcs_with_seventh(mk(4, Quality::Maj), am)) == std::set<int>({4, 8, 11, 2}),
+              "E (the V of Am) -> E7 (adds D, dominant 7th)");
+        Key cmajk; cmajk.tonic = 0; cmajk.mode = Mode::Major;
+        CHECK(pcs(pcs_with_seventh(mk(0, Quality::Maj), cmajk)) == std::set<int>({0, 4, 7, 11}),
+              "C (the I of C major) -> Cmaj7 (adds B)");
+        // seventh_chords=false keeps triads.
+        Knobs plain; plain.register_lo = 55; plain.register_hi = 79;
+        plain.seventh_chords = false;
+        MidiPlan tp = build_midi_plan(a, 120.0, plain);
+        std::set<int> p0;
+        for (auto& e : tp.events) if (e.on && e.frame == 0) p0.insert(((e.pitch % 12) + 12) % 12);
+        CHECK(p0 == std::set<int>({9, 0, 4}), "seventh_chords=false -> plain Am triad");
+    }
+
+    // 8e) Harmonic feedback merge: the model's own detected chords fold into
+    //     the input-derived analysis under key/confidence/beat-position rules.
+    {
+        Analysis base;
+        base.beats_per_bar = 4; base.bars = 1;
+        base.key.tonic = 9; base.key.mode = Mode::Minor;
+        base.level = HarmonyLevel::KeyScale;
+        for (int i = 0; i < 4; ++i) base.beats.push_back(mk(9, Quality::Min));  // Am Am Am Am
+
+        Analysis ai = base;
+        ai.beats[0] = mk(0, Quality::Maj);   // C on the DOWNBEAT: root must not move
+        ai.beats[1] = mk(0, Quality::Maj);   // C on a weak beat: diatonic substitute, adopted
+        ai.beats[2] = mk(6, Quality::Maj);   // F#: out of A minor, ignored
+        ai.beats[3] = mk(9, Quality::Maj);   // same root, new quality: color adopted
+        ai.beats[3].confidence = 0.9f;
+
+        Analysis m = merge_harmonic_feedback(base, ai);
+        CHECK(m.beats[0].root == 9, "downbeat keeps the input root");
+        CHECK(m.beats[1].root == 0 && m.beats[1].quality == Quality::Maj,
+              "weak-beat diatonic substitute is adopted");
+        CHECK(m.beats[2].root == 9, "out-of-key candidate is ignored");
+        CHECK(m.beats[3].root == 9 && m.beats[3].quality == Quality::Maj,
+              "same-root quality (color) is adopted");
+
+        Analysis lowconf = base;
+        lowconf.beats[1] = mk(0, Quality::Maj);
+        lowconf.beats[1].confidence = 0.2f;
+        Analysis m2 = merge_harmonic_feedback(base, lowconf);
+        CHECK(m2.beats[1].root == 9, "low-confidence candidate is ignored");
     }
 
     // 9) invert_voicing: rotates within the register, keeps pitch classes.

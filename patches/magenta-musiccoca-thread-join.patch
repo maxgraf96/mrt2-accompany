@@ -1,0 +1,60 @@
+--- a/core/src/mlx_engine.cpp
++++ b/core/src/mlx_engine.cpp
+@@ -200,6 +200,13 @@
+   // --- MusicCoCa async token state ---
+   mutable std::mutex musiccoca_mutex_;
+   std::atomic<bool> is_musiccoca_fetching_{false};
++  // [mrt2-accompany local patch] The MusicCoCa worker thread used to be
++  // detached with a raw `this` capture; destroying the engine while an encode
++  // was in flight (e.g. host removes the plugin mid audio-prompt encode) let
++  // the thread touch destroyed mutexes / freed TFLite interpreters and abort
++  // the host. Keep the handle and join before unload() in ~Impl.
++  std::thread musiccoca_thread_;
++  std::mutex musiccoca_thread_mutex_;  // guards the handle, not the work
+   std::atomic<int> text_encoder_status_{
+       0}; // 0=idle 1=fetching 2=success 3=error
+   std::atomic<int> prompt_statuses_[kMaxPrompts]{};
+@@ -257,7 +264,18 @@
+   FrameMetrics last_metrics_;
+ };
+ 
+-MLXEngine::Impl::~Impl() { unload(); }
++MLXEngine::Impl::~Impl() {
++  // [mrt2-accompany local patch] Wait out any in-flight MusicCoCa encode
++  // before unload() frees the TFLite interpreters it is using. Worst case
++  // this blocks teardown for one encode (~seconds); the alternative was a
++  // host crash (mutex/interpreter use-after-free in the detached thread).
++  {
++    std::lock_guard<std::mutex> lk(musiccoca_thread_mutex_);
++    if (musiccoca_thread_.joinable())
++      musiccoca_thread_.join();
++  }
++  unload();
++}
+ 
+ bool MLXEngine::Impl::init_assets(const char *resource_dir,
+                                   const char *model_subfolder) {
+@@ -1691,7 +1709,13 @@
+   text_encoder_status_ = 1; // fetching
+   quantizer_status_ = 0;    // idle
+ 
+-  std::thread([this]() {
++  // [mrt2-accompany local patch] Joinable, not detached (see ~Impl). Reap the
++  // previous thread first: with is_musiccoca_fetching_ false it has exited or
++  // is unwinding, so this join is momentary.
++  std::lock_guard<std::mutex> handle_lk(musiccoca_thread_mutex_);
++  if (musiccoca_thread_.joinable())
++    musiccoca_thread_.join();
++  musiccoca_thread_ = std::thread([this]() {
+     struct Guard {
+       std::atomic<bool> &flag;
+       Impl *impl;
+@@ -1732,7 +1756,7 @@
+       text_encoder_status_ = 3;
+       quantizer_status_ = 3;
+     }
+-  }).detach();
++  });  // [mrt2-accompany local patch] was .detach()
+ }
+ 
+ void MLXEngine::Impl::set_audio_embedding(int index, const float *embedding) {

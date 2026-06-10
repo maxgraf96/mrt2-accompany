@@ -47,6 +47,13 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     attach(variation_, "Variation", "variation", variationA_);
     attach(dryMix_, "Dry Mix", "drymix", dryMixA_);
     attach(outGain_, "Out Gain", "outgain", outGainA_);
+    channelLabFirst_ = (int)knobs_.size();
+    attach(contextFeedback_, "Ctx Feedback", "contextfeedback", contextFeedbackA_);
+    attach(contextRefresh_, "Ctx Bars", "contextrefresh", contextRefreshA_);
+    attach(styleBlend_, "Style Blend", "styleblend", styleBlendA_);
+    attach(hintDensity_, "Hint Density", "hintdensity", hintDensityA_);
+    attach(hintHold_, "Hint Hold", "hinthold", hintHoldA_);
+    attach(unmask_, "Unmask", "unmask", unmaskA_);
 
     for (int i = 0; i < 12; ++i) keyBox_.addItem(kPc[i], i + 1);
     keyBox_.setLookAndFeel(&lnf_);
@@ -59,9 +66,10 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     // Picking a key/scale engages Lock (so the dropdowns "just work"); the Lock
     // toggle stays as the explicit Auto<->Lock control.
     keyBox_.addListener(this); scaleBox_.addListener(this);
-    for (auto* t : { &keyLock_, &drums_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
-    keyLockA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
-    drumsA_   = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
+    for (auto* t : { &keyLock_, &drums_, &noteGuide_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
+    keyLockA_   = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
+    drumsA_     = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
+    noteGuideA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "noteguide", noteGuide_);
 
     relock_.setLookAndFeel(&lnf_);
     relock_.onClick = [this] {
@@ -73,7 +81,11 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     };
     addAndMakeVisible(relock_);
 
-    setSize(560, 664);
+    resetHist_.setLookAndFeel(&lnf_);
+    resetHist_.onClick = [this] { proc_.resetHistory(); };
+    addAndMakeVisible(resetHist_);
+
+    setSize(560, 846);
     startTimerHz(8);
     constructed_ = true;
 }
@@ -103,18 +115,27 @@ void PluginEditor::resized() {
     r.removeFromTop(20);                        // detect line (painted) sits under wave
     r.removeFromTop(16);
 
-    // 9 knobs across two rows of up to 5 (generative row, then utility row).
-    const int perRow = 5;
-    for (int i = 0; i < (int)knobs_.size(); ) {
-        auto knobRow = r.removeFromTop(92);
-        const int kw = knobRow.getWidth() / perRow;
-        for (int j = 0; j < perRow && i < (int)knobs_.size(); ++j, ++i) {
-            auto cell = knobRow.removeFromLeft(kw);
-            knobs_[(size_t)i].cell = cell;
-            knobs_[(size_t)i].s->setBounds(cell.reduced(6).withTrimmedTop(16).withTrimmedBottom(16));
+    auto layoutKnobs = [this, &r](int begin, int end, int perRow) {
+        int i = begin;
+        while (i < end) {
+            auto knobRow = r.removeFromTop(92);
+            const int kw = knobRow.getWidth() / perRow;
+            for (int j = 0; j < perRow && i < end; ++j, ++i) {
+                auto cell = knobRow.removeFromLeft(kw);
+                knobs_[(size_t)i].cell = cell;
+                knobs_[(size_t)i].s->setBounds(cell.reduced(6).withTrimmedTop(16).withTrimmedBottom(16));
+            }
+            r.removeFromTop(8);
         }
-        r.removeFromTop(8);
-    }
+    };
+
+    // Main musical controls.
+    layoutKnobs(0, channelLabFirst_, 5);
+    r.removeFromTop(2);
+    channelLabHdr_ = r.removeFromTop(14);
+    r.removeFromTop(2);
+    layoutKnobs(channelLabFirst_, (int)knobs_.size(), 3);
+    channelLabLine_ = r.removeFromTop(18);
     r.removeFromTop(8);
 
     keyHdr_ = r.removeFromTop(14);             // "KEY"
@@ -125,9 +146,13 @@ void PluginEditor::resized() {
     keyRow.removeFromLeft(14);
     keyLock_.setBounds(keyRow.removeFromLeft(70));
     drums_.setBounds(keyRow.removeFromRight(90));
+    noteGuide_.setBounds(keyRow.removeFromRight(120));
     r.removeFromTop(16);
 
-    relock_.setBounds(r.removeFromTop(42));
+    auto buttonRow = r.removeFromTop(42);
+    resetHist_.setBounds(buttonRow.removeFromRight((buttonRow.getWidth() - 10) / 2));
+    buttonRow.removeFromRight(10);
+    relock_.setBounds(buttonRow);
 }
 
 static void sectionLabel(juce::Graphics& g, juce::Rectangle<int> b, const juce::String& t) {
@@ -201,17 +226,23 @@ void PluginEditor::paint(juce::Graphics& g) {
     g.drawText(detectLine_, juce::Rectangle<int>(waveBounds_.getX(), waveBounds_.getBottom() + 4,
                waveBounds_.getWidth(), 18), juce::Justification::centredLeft, false);
 
+    line(channelLabHdr_.getY() - 8);
+    sectionLabel(g, channelLabHdr_, "Channel Lab  " + DOT + "  debug");
+
     // Knob labels + values (work on a copy — k.cell is persistent layout state).
     for (auto& k : knobs_) {
         auto cell = k.cell;
         g.setColour(ui::muted); g.setFont(ui::font(11.5f));
         g.drawText(k.name, cell.removeFromTop(15).expanded(6, 0), juce::Justification::centred, false);
         g.setColour(ui::text); g.setFont(ui::font(12.0f, true));
-        juce::String v = (k.name == "Bars" || k.name == "Variation")
+        juce::String v = (k.name == "Bars" || k.name == "Variation" || k.name == "Unmask")
             ? juce::String((int)k.s->getValue())
             : juce::String(k.s->getValue(), 2);
         g.drawText(v, cell.removeFromBottom(15), juce::Justification::centred, false);
     }
+
+    g.setColour(ui::muted); g.setFont(ui::font(12.0f));
+    g.drawText(labLine_, channelLabLine_, juce::Justification::centredLeft, false);
 
     line(keyHdr_.getY() - 8);
     sectionLabel(g, keyHdr_, "Key  " + DOT + "  override");
@@ -229,6 +260,7 @@ void PluginEditor::timerCallback() {
     using AS = PluginProcessor::AssetState;
     const AS as = proc_.assetState();
     if (as == AS::NeedsDownload || as == AS::Downloading || as == AS::Failed) {
+        resetHist_.setEnabled(false);   // no history to reset until the model is local
         const int pct = (int)std::round(proc_.downloadProgress() * 100.0f);
         if (as == AS::NeedsDownload) {
             relock_.setButtonText("Download MRT2 model  (~3 GB, one time)");
@@ -244,24 +276,50 @@ void PluginEditor::timerCallback() {
             detectLine_ = "Download failed. Check your connection and retry.";
         }
         statusLine_ = "Engine: waiting for model assets";
+        labLine_ = "Lab: waiting for model assets";
         repaint();
         return;
     }
-    relock_.setButtonText(proc_.relockPending() ? "Re-lock armed " + ELL + " (next loop)"
+    relock_.setButtonText(proc_.relockPending() ? "Re-lock armed " + ELL
                                                  : "Re-lock to loop");
-    relock_.setEnabled(proc_.loadState() == AccompanyRunner::LoadState::Ready);
+    resetHist_.setButtonText(proc_.resetHistoryPending() ? "Reset armed " + ELL
+                                                         : "Reset history");
+    const bool ready = proc_.loadState() == AccompanyRunner::LoadState::Ready;
+    relock_.setEnabled(ready);
+    resetHist_.setEnabled(ready);
 
     juce::String line = "Engine: ";
     switch (proc_.loadState()) {
         case AccompanyRunner::LoadState::Loading: line << "loading model" << ELL; break;
-        case AccompanyRunner::LoadState::Ready:
+        case AccompanyRunner::LoadState::Ready: {
             line << juce::String(proc_.runner().last_frame_ms(), 1) << " ms/frame  " << DOT << "  buf "
                  << (int)(proc_.runner().ring_available() / 1920) << "  " << DOT << "  drops "
-                 << (int)proc_.runner().dropped(); break;
+                 << (int)proc_.runner().dropped();
+            // While the layer bootstraps, cfg_notes is floored above the knob
+            // (the notes-blind CFG branch can't contain piano until piano
+            // exists in the context) — show the effective value so a low knob
+            // reading "more notes than asked" isn't mystifying.
+            const float floor_ = proc_.noteBootstrapFloor();
+            const float knob = proc_.apvts().getRawParameterValue("cfgnotes")->load();
+            const bool guide = proc_.apvts().getRawParameterValue("noteguide")->load() > 0.5f;
+            if (proc_.recovering())
+                line << "  " << DOT << "  notes" << juce::String(floor_, 1) << " (recover)";
+            else if (guide && floor_ > knob + 0.05f)
+                line << "  " << DOT << "  notes" << juce::String(floor_, 1) << " (bootstrap)";
+            break;
+        }
         case AccompanyRunner::LoadState::Failed: line << "load FAILED (check assets)"; break;
         default: line << "idle"; break;
     }
     statusLine_ = line;
+    labLine_ = "Lab: sty " + juce::String(proc_.uiEffectiveStyleBlend(), 2)
+             + (proc_.recovering() ? " rec" : "")
+             + "  " + DOT + "  ctx " + juce::String(proc_.uiEffectiveContextFeedback(), 2)
+             + "/" + juce::String(proc_.uiEffectiveContextRefreshBars(), 1) + "bar"
+             + "  " + DOT + "  n " + juce::String(proc_.uiEffectiveCfgNotes(), 1)
+             + "  " + DOT + "  h " + juce::String(proc_.uiEffectiveHintDensity(), 2)
+             + "/" + juce::String(proc_.uiEffectiveHintHold(), 2)
+             + "  " + DOT + "  u " + juce::String(proc_.uiEffectiveUnmask());
 
     const int bars = (int)proc_.apvts().getRawParameterValue("bars")->load();
     juce::String d;

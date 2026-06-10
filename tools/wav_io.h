@@ -41,6 +41,12 @@ inline bool read_wav(const std::string& path, WavData& out) {
             size_t o = data_off + (i*nch + ch) * (bits/8);
             if (fmt == 3 && bits == 32) { float v; std::memcpy(&v, &d[o], 4); return v; }
             if (fmt == 1 && bits == 16) { int16_t v; std::memcpy(&v, &d[o], 2); return v / 32768.0f; }
+            if (fmt == 1 && bits == 24) {
+                int32_t v = (int32_t)(((uint32_t)(uint8_t)d[o] << 8) |
+                                      ((uint32_t)(uint8_t)d[o+1] << 16) |
+                                      ((uint32_t)(uint8_t)d[o+2] << 24)) >> 8;
+                return v / 8388608.0f;
+            }
             return 0.0f;
         };
         float l = samp(0), r = nch > 1 ? samp(1) : l;

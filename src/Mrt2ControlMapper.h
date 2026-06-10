@@ -45,6 +45,10 @@ struct Knobs {
     // where the input leaves room). Set both >=0 to force a fixed register.
     int   register_lo = -1;
     int   register_hi = -1;
+    // Voice diatonic 7ths instead of bare triads (Am -> Am7, the V -> dom7).
+    // Triads fight a jazz prompt; extensions make the hints stylistically
+    // plausible. Off only matters for deliberately plain styles.
+    bool  seventh_chords = true;
     // User's Key field — the fallback harmony when the input is atonal
     // (HarmonyLevel::None). Also the lock target when the user locks the key.
     int   user_key_tonic = 9;     // pitch class, default A
@@ -57,6 +61,11 @@ struct Knobs {
     float cfg_musiccoca = kCfgUnset;
     float cfg_notes     = kCfgUnset;
     float cfg_drums     = kCfgUnset;
+    // Low-level Channel Lab controls. Left unset, they derive from Follow so
+    // existing tools/tests and the musical macro keep their current behaviour.
+    float hint_density  = kCfgUnset;  // -> re-articulation cadence
+    float hint_hold     = kCfgUnset;  // -> note-token hold duration
+    int   unmask_width  = -1;         // >=0 overrides Follow-derived unmask
 };
 
 // Macro -> CFG mappings. Shared by resolve_params and the plugin's macro
@@ -69,23 +78,48 @@ struct Knobs {
 inline float cfg_musiccoca_from_freedom(float freedom) {
     return std::clamp(4.5f - 1.5f * std::clamp(freedom, 0.0f, 1.0f), 0.0f, 8.0f);
 }
-// Follow 0 -> 1.0 (a whisper of harmony), 0.4 (default) -> ~4.0 (the tuned
-// "locked + flowing" point), 1 -> 6.5 (tightly locked). Quadratic so the
-// default stays where it was tuned while the bottom end actually lets go.
+// Linear over the FULL meaningful CFG range, so the knob reads literally:
+//   logits = cond + cfg * (cond - notes_blind)
+//   Follow 0    -> -1   (exactly the notes-blind prediction: harmony ignored)
+//   Follow 0.13 ->  0   (notes at natural, as-trained strength)
+//   Follow 0.4  ->  2   (default: gentle amplification)
+//   Follow 1    ->  6.5 (tightly locked)
 inline float cfg_notes_from_follow(float follow) {
     const float f = std::clamp(follow, 0.0f, 1.0f);
-    return std::clamp(1.0f + 9.0f * f - 3.5f * f * f, -1.0f, 7.0f);
+    return std::clamp(-1.0f + 7.5f * f, -1.0f, 7.0f);
 }
 inline float cfg_drums_from_toggle(bool drums) { return drums ? 1.0f : 3.0f; }
 
-// Follow also sets the chord-pulse density of the MIDI plan itself (the CFG
-// scale alone can't unstick the rhythm: re-onsetting every chord tone on
-// every beat IS a quarter-note instruction, however weak the guidance).
-// Returns the re-articulation period in beats; 0 = only on chord changes.
+// Follow also shapes the MIDI plan itself, because the pianoroll conditioning
+// is TEACHER-FORCING, not a suggestion: "note token = this pitch is sounding
+// right now". Sustained chord tones therefore read as a literal block-chord
+// score and the model dutifully renders 8 stabs per loop, whatever the CFG
+// scale says. Two plan levers per Follow tier:
+//   - pulse density: re-articulation period in beats (0 = chord changes only);
+//   - hold time: how long after the onset the tones stay "sounding" before
+//     releasing back to MASKED (= model-free). A short hold says "a note
+//     starts on this beat" and then lets the model voice/sustain/run lines
+//     on its own; a full hold dictates the chord for the whole pulse.
 inline int rearticulation_period_from_follow(float follow) {
     if (follow >= 0.55f) return 1;   // every beat: tight rhythmic lock
     if (follow >= 0.25f) return 2;   // half-note pulse
     return 0;                        // chord changes only: free rhythm
+}
+inline int rearticulation_period_from_hint_density(float density) {
+    return rearticulation_period_from_follow(density);
+}
+// Returns the hold length in engine frames; 0 = sustain until the next pulse.
+inline int hold_frames_from_hint_hold(float hold, double frames_per_beat, int pulse_period) {
+    if (hold >= 0.55f) return 0;                         // score-like sustain
+    if (hold >= 0.25f) {                                 // half the pulse gap
+        const int period = pulse_period > 0 ? pulse_period : 1;
+        return std::max(3, (int)(frames_per_beat * period * 0.5 + 0.5));
+    }
+    return 3;                                            // ~120 ms hint
+}
+inline int hold_frames_from_follow(float follow, double frames_per_beat) {
+    return hold_frames_from_hint_hold(follow, frames_per_beat,
+                                      rearticulation_period_from_follow(follow));
 }
 
 // Resolved engine parameters for one configuration (the §6 table).
@@ -106,6 +140,25 @@ EngineParams resolve_params(const Knobs& k);
 // Voice one chord into ascending MIDI pitches within [lo, hi], mid register.
 // For degraded analyses the chord already carries key-diatonic qualities.
 std::vector<int> voice_chord(const Chord& chord, int lo, int hi);
+// Same, from explicit pitch classes (root first — it anchors the voicing).
+std::vector<int> voice_pcs(const std::vector<int>& pcs, int lo, int hi);
+
+// The chord's pitch classes extended with its diatonic 7th in `key`:
+// major on the key's dominant -> b7 (dom7), other majors -> maj7,
+// minor/dim -> b7 (m7 / m7b5).
+std::vector<int> pcs_with_seventh(const Chord& chord, const Key& key);
+
+// Fold the model's OWN detected harmony (analyzed from the captured AI layer)
+// back into the input-derived analysis, so reharmonizations the model plays
+// persist into the next loop's hints instead of being reset to bass-derived
+// chords. Rules, per beat (candidate = the AI layer's chord):
+//   - ignored unless confident (>= conf_floor) and diatonic to base's key;
+//   - same root as the input chord -> adopt the AI's QUALITY (color upgrade);
+//   - different root on a WEAK beat -> adopt the AI chord (passing/substitute);
+//   - downbeats keep the input root (the bass defines the floor).
+// No-op when base has no usable harmony (HarmonyLevel::None) or sizes differ.
+Analysis merge_harmonic_feedback(Analysis base, const Analysis& ai,
+                                 float conf_floor = 0.5f);
 
 // Pick a ~1.5-octave [lo, hi] register where the input leaves the most room
 // (min input energy in the window). Generalizes bass-avoidance to "complement

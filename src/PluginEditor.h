@@ -34,23 +34,28 @@ private:
     juce::TextEditor prompt_;
 
     juce::Slider freedom_, follow_, cfgStyle_, cfgNotes_, cfgDrums_, bars_, variation_, dryMix_, outGain_;
+    juce::Slider styleBlend_, contextFeedback_, contextRefresh_, hintDensity_, hintHold_, unmask_;
     std::unique_ptr<SliderAttach> freedomA_, followA_, cfgStyleA_, cfgNotesA_, cfgDrumsA_,
                                   barsA_, variationA_, dryMixA_, outGainA_;
+    std::unique_ptr<SliderAttach> styleBlendA_, contextFeedbackA_, contextRefreshA_,
+                                  hintDensityA_, hintHoldA_, unmaskA_;
 
     juce::ComboBox keyBox_, scaleBox_;
-    juce::ToggleButton keyLock_{"Lock"}, drums_{"Drums"};
+    juce::ToggleButton keyLock_{"Lock"}, drums_{"Drums"}, noteGuide_{"Note Guide"};
     std::unique_ptr<ComboAttach> keyA_, scaleA_;
-    std::unique_ptr<ButtonAttach> keyLockA_, drumsA_;
+    std::unique_ptr<ButtonAttach> keyLockA_, drumsA_, noteGuideA_;
 
     juce::TextButton relock_{"Re-lock to loop"};
+    juce::TextButton resetHist_{"Reset history"};
 
     std::vector<float> wave_;    // cached captured-loop peaks for paint()
-    juce::String statusLine_, detectLine_;
+    juce::String statusLine_, detectLine_, labLine_;
 
     // Knob geometry filled by resized(), used by paint() for labels/values.
     struct KnobInfo { juce::Slider* s; juce::String name; juce::Rectangle<int> cell; };
     std::vector<KnobInfo> knobs_;
-    juce::Rectangle<int> waveBounds_, promptHdr_, keyHdr_;
+    int channelLabFirst_ = 0;
+    juce::Rectangle<int> waveBounds_, promptHdr_, keyHdr_, channelLabHdr_, channelLabLine_;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PluginEditor)
 };
