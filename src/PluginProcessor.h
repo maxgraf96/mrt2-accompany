@@ -13,7 +13,9 @@
 #include "AssetManager.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <string>
 #include <thread>
 
@@ -61,7 +63,10 @@ public:
     bool  uiLocked() const { return uiLocked_.load(); }
     float uiEffectiveStyleBlend() const { return effStyleBlend_.load(); }
     float uiEffectiveContextFeedback() const { return effContextFeedback_.load(); }
-    float uiEffectiveContextRefreshBars() const { return effContextRefreshBars_.load(); }
+    int uiEffectiveContextRefreshBars() const { return effContextRefreshBars_.load(); }
+    int uiMaxContextRefreshBars() const {
+        return maxContextRefreshBars(curBpm_.load(), curBeatsPerBar_.load());
+    }
     float uiEffectiveCfgNotes() const { return effCfgNotes_.load(); }
     float uiEffectiveHintDensity() const { return effHintDensity_.load(); }
     float uiEffectiveHintHold() const { return effHintHold_.load(); }
@@ -121,6 +126,13 @@ private:
     void ensureLoaded();                            // check assets, load once on first prepareToPlay
     void startEngineLoad();                         // kick the model load + worker
     void workerLoop();                              // background analyze + prefill
+    static int maxContextRefreshBars(double bpm, int beatsPerBar) {
+        constexpr double kContextSeconds = 19.7;
+        const double safeBpm = std::max(1.0, bpm);
+        const int safeBeatsPerBar = juce::jmax(1, beatsPerBar);
+        const int bars = (int)std::floor(kContextSeconds * safeBpm / (60.0 * safeBeatsPerBar));
+        return juce::jmax(1, bars);
+    }
 
     // Ring headroom (25 fps frames) that bridges a prefill stall, sized from
     // the measured duration of the matching prefill TYPE (a full re-seed runs
@@ -185,7 +197,7 @@ private:
     std::atomic<bool> uiLocked_{false};
     std::atomic<float> effStyleBlend_{0.03f};
     std::atomic<float> effContextFeedback_{1.0f};
-    std::atomic<float> effContextRefreshBars_{4.0f};
+    std::atomic<int> effContextRefreshBars_{4};
     std::atomic<float> effCfgNotes_{2.0f};
     std::atomic<float> effHintDensity_{0.4f};
     std::atomic<float> effHintHold_{0.4f};

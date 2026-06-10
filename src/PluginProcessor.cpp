@@ -46,7 +46,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<P>(juce::ParameterID{"styleblend", 1}, "Style Blend", R{0.f, 0.1f}, 0.03f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"contextfeedback", 1}, "Context Feedback", R{0.f, 1.f}, 1.0f));
     // Automatic KV refresh cadence in musical bars. 0 = manual-only.
-    p.push_back(std::make_unique<P>(juce::ParameterID{"contextrefresh", 1}, "Context Refresh", R{0.f, 16.f}, 4.0f));
+    p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"contextrefresh", 1}, "Context Refresh", 0, 16, 4));
     p.push_back(std::make_unique<P>(juce::ParameterID{"hintdensity", 1}, "Hint Density", R{0.f, 1.f}, 0.4f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"hinthold", 1}, "Hint Hold", R{0.f, 1.f}, 0.4f));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"unmask", 1}, "Unmask", 0, 8, 3));
@@ -393,13 +393,15 @@ void PluginProcessor::workerLoop() {
     int pendingTonic = -1;  bool pendingMajor = false;
 
     while (workerRun_.load()) {
-        const double refreshBars = apvts_.getRawParameterValue("contextrefresh")->load();
+        const int rawRefreshBars = (int)apvts_.getRawParameterValue("contextrefresh")->load();
         const double bpmNow = std::max(1.0, curBpm_.load());
         const int beatsPerBarNow = juce::jmax(1, curBeatsPerBar_.load());
+        const int maxRefreshBars = maxContextRefreshBars(bpmNow, beatsPerBarNow);
+        const int refreshBars = rawRefreshBars > 0 ? juce::jmin(rawRefreshBars, maxRefreshBars) : 0;
         const double refreshSec = refreshBars > 0.0
             ? refreshBars * beatsPerBarNow * 60.0 / bpmNow
             : 0.0;
-        effContextRefreshBars_.store((float)refreshBars);
+        effContextRefreshBars_.store(refreshBars);
         // Pre-arm: when the next boundary is likely to re-ground, deepen the
         // ring target so generation builds enough audio to bridge the prefill.
         // Headroom builds at the engine's measured surplus over realtime

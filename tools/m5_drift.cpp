@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
     };
     if (style_blend >= 0)       setFloat("styleblend", style_blend, 0.0, 0.1);
     if (context_feedback >= 0)  setFloat("contextfeedback", context_feedback, 0.0, 1.0);
-    if (context_refresh >= 0)   setFloat("contextrefresh", context_refresh, 0.0, 16.0);
+    if (context_refresh >= 0)   setFloat("contextrefresh", std::lround(context_refresh), 0.0, 16.0);
     if (cfg_style > -999)       setFloat("cfgstyle", cfg_style, 0.0, 7.0);
     if (cfg_notes > -999)       setFloat("cfgnotes", cfg_notes, -1.0, 7.0);
     if (hint_density >= 0)      setFloat("hintdensity", hint_density, 0.0, 1.0);

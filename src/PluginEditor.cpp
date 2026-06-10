@@ -235,7 +235,8 @@ void PluginEditor::paint(juce::Graphics& g) {
         g.setColour(ui::muted); g.setFont(ui::font(11.5f));
         g.drawText(k.name, cell.removeFromTop(15).expanded(6, 0), juce::Justification::centred, false);
         g.setColour(ui::text); g.setFont(ui::font(12.0f, true));
-        juce::String v = (k.name == "Bars" || k.name == "Variation" || k.name == "Unmask")
+        juce::String v = (k.name == "Bars" || k.name == "Variation" ||
+                          k.name == "Unmask" || k.name == "Ctx Bars")
             ? juce::String((int)k.s->getValue())
             : juce::String(k.s->getValue(), 2);
         g.drawText(v, cell.removeFromBottom(15), juce::Justification::centred, false);
@@ -312,10 +313,21 @@ void PluginEditor::timerCallback() {
         default: line << "idle"; break;
     }
     statusLine_ = line;
+    const int rawCtxBars = (int)proc_.apvts().getRawParameterValue("contextrefresh")->load();
+    const int effCtxBars = proc_.uiEffectiveContextRefreshBars();
+    const int maxCtxBars = proc_.uiMaxContextRefreshBars();
+    juce::String ctxBarsText;
+    if (rawCtxBars <= 0)
+        ctxBarsText = "manual";
+    else if (rawCtxBars != effCtxBars)
+        ctxBarsText = juce::String(rawCtxBars) + "->" + juce::String(effCtxBars) + "bar";
+    else
+        ctxBarsText = juce::String(effCtxBars) + "bar";
+
     labLine_ = "Lab: sty " + juce::String(proc_.uiEffectiveStyleBlend(), 2)
              + (proc_.recovering() ? " rec" : "")
              + "  " + DOT + "  ctx " + juce::String(proc_.uiEffectiveContextFeedback(), 2)
-             + "/" + juce::String(proc_.uiEffectiveContextRefreshBars(), 1) + "bar"
+             + "/" + ctxBarsText + " max" + juce::String(maxCtxBars)
              + "  " + DOT + "  n " + juce::String(proc_.uiEffectiveCfgNotes(), 1)
              + "  " + DOT + "  h " + juce::String(proc_.uiEffectiveHintDensity(), 2)
              + "/" + juce::String(proc_.uiEffectiveHintHold(), 2)
