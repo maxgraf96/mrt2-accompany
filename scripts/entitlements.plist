@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for MRT2-Accompany release builds.
+  Mirrors SA3-Variations' validated set (MLX under the hardened runtime):
+
+  com.apple.security.cs.allow-jit
+      MLX compiles Metal compute pipelines on first use; that counts as
+      JIT under the hardened runtime even though the kernels themselves
+      are precompiled in mlx.metallib.
+
+  com.apple.security.cs.allow-unsigned-executable-memory
+      MLX maps writable+executable pages for its on-the-fly graph runtime.
+
+  com.apple.security.cs.disable-library-validation
+      MLX is statically linked here (unlike SA3), but the mlx.metallib
+      discovery and TFLite delegate paths go through the same loader
+      checks; kept for parity with the configuration proven to pass
+      notarization and run inside hardened-runtime hosts.
+
+  com.apple.security.device.audio-input
+      The Standalone app records the input loop from a live audio device.
+      Without this the hardened runtime denies mic access outright.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

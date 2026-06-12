@@ -33,22 +33,26 @@ private:
 
     juce::TextEditor prompt_;
 
-    juce::Slider freedom_, follow_, cfgStyle_, cfgNotes_, cfgDrums_, bars_, variation_, dryMix_, outGain_;
-    juce::Slider styleBlend_, contextFeedback_, contextRefresh_, hintDensity_, hintHold_, unmask_;
+    juce::Slider freedom_, follow_, cfgStyle_, cfgNotes_, cfgDrums_, bars_, variation_, reharm_, dryMix_, outGain_;
+    juce::Slider temp_, styleBlend_, contextFeedback_, contextRefresh_, hintDensity_, hintHold_, unmask_;
     std::unique_ptr<SliderAttach> freedomA_, followA_, cfgStyleA_, cfgNotesA_, cfgDrumsA_,
-                                  barsA_, variationA_, dryMixA_, outGainA_;
-    std::unique_ptr<SliderAttach> styleBlendA_, contextFeedbackA_, contextRefreshA_,
+                                  barsA_, variationA_, reharmA_, dryMixA_, outGainA_;
+    std::unique_ptr<SliderAttach> tempA_, styleBlendA_, contextFeedbackA_, contextRefreshA_,
                                   hintDensityA_, hintHoldA_, unmaskA_;
 
     juce::ComboBox keyBox_, scaleBox_;
-    juce::ToggleButton keyLock_{"Lock"}, drums_{"Drums"}, noteGuide_{"Note Guide"};
+    juce::ToggleButton keyLock_{"Lock"}, drums_{"Drums"}, noteGuide_{"Note Guide"}, bassFocus_{"Bass Focus"};
     std::unique_ptr<ComboAttach> keyA_, scaleA_;
-    std::unique_ptr<ButtonAttach> keyLockA_, drumsA_, noteGuideA_;
+    std::unique_ptr<ButtonAttach> keyLockA_, drumsA_, noteGuideA_, bassFocusA_;
 
     juce::TextButton relock_{"Re-lock to loop"};
     juce::TextButton resetHist_{"Reset history"};
 
-    std::vector<float> wave_;    // cached captured-loop peaks for paint()
+    // Live output scope: the most-recent peak columns, refreshed at 60 fps and
+    // drawn as a sliding waveform (newest column at the right edge).
+    std::vector<float> scope_;
+    static constexpr int kScopeCols = 512;   // ~4 s window at the processor's column rate
+    int tick_ = 0;                           // 60 fps tick; status/buttons refresh every 8th
     juce::String statusLine_, detectLine_, labLine_;
 
     // Knob geometry filled by resized(), used by paint() for labels/values.

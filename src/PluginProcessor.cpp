@@ -40,6 +40,8 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
                                     cfg_notes_from_follow(0.4f)));
     p.push_back(std::make_unique<P>(juce::ParameterID{"cfgdrums", 1}, "CFG Drums", R{0.f, 7.f},
                                     cfg_drums_from_toggle(false)));
+    p.push_back(std::make_unique<P>(juce::ParameterID{"temp", 1}, "Temperature", R{0.5f, 2.f},
+                                    temperature_from_freedom(0.35f)));
     // MusicCoCa blend quantizes to 12 discrete style tokens, so tiny audio-
     // blend changes can cause large style jumps. Keep this intentionally small:
     // above ~0.1 bass/drum loops tend to pull the style into source-copying.
@@ -51,6 +53,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<P>(juce::ParameterID{"hinthold", 1}, "Hint Hold", R{0.f, 1.f}, 0.4f));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"unmask", 1}, "Unmask", 0, 8, 3));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"variation", 1}, "Variation", 0, 15, 0));
+    p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"reharm", 1}, "Reharm", 0, 4, 1));
     p.push_back(std::make_unique<P>(juce::ParameterID{"drymix", 1}, "Dry Mix", R{0.f, 1.f}, 0.0f));
     p.push_back(std::make_unique<P>(juce::ParameterID{"outgain", 1}, "Output Gain", R{-24.f, 12.f}, 0.0f));
     p.push_back(std::make_unique<juce::AudioParameterInt>(juce::ParameterID{"bars", 1}, "Loop Bars", 1, 8, 4));
@@ -59,6 +62,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout PluginProcessor::makeParams(
     p.push_back(std::make_unique<juce::AudioParameterChoice>(juce::ParameterID{"keymajor", 1}, "Scale",
                 juce::StringArray{"Minor", "Major"}, 0));  // index 0=Minor; raw>0.5 => Major
     p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"keylock", 1}, "Lock Key", false));
+    p.push_back(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"bassfocus", 1}, "Bass Focus", true));
     // Note Guide OFF = the radical mode: NO pianoroll conditioning at all.
     // The model is steered purely by what it hears (context re-grounding with
     // the input + its own layer) and the blended style prompt. No harmony
@@ -106,9 +110,14 @@ void PluginProcessor::parameterChanged(const juce::String& id, float value) {
         if (auto* pi = dynamic_cast<juce::AudioParameterInt*>(apvts_.getParameter(pid)))
             *pi = v;
     };
-    if (id == "freedom")     setCfg("cfgstyle", cfg_musiccoca_from_freedom(value));
+    if (id == "freedom")     { setCfg("cfgstyle", cfg_musiccoca_from_freedom(value));
+                               setCfg("temp", temperature_from_freedom(value)); }
     else if (id == "follow") {
-        setCfg("cfgnotes", cfg_notes_from_follow(value));
+        // Decision A: Follow drives ONLY the scaffold coverage (the Freedom
+        // morph) — hint density/hold/unmask. cfg_notes is DECOUPLED and left at
+        // its own confident value, so freedom = how MUCH of the timeline/voicing
+        // is pinned, not how hard the conditioning pushes. Scaling cfg_notes down
+        // here only starves the layer toward silence (the failure we want to avoid).
         setCfg("hintdensity", value);
         setCfg("hinthold", value);
         setIntParam("unmask", (int)std::lround(8.0f * juce::jlimit(0.0f, 1.0f, value)));
@@ -181,6 +190,17 @@ void PluginProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     aiPushL_.assign((size_t)samplesPerBlock + 16, 0.0f);
     aiPushR_.assign((size_t)samplesPerBlock + 16, 0.0f);
     synthSamplePos_ = 0;
+
+    // Live output scope: ~130 columns/s at the host rate, so the editor's
+    // sliding window holds a few seconds and advances a couple of columns per
+    // 60 fps frame. Reset the accumulator; the ring keeps its history.
+    constexpr double kScopeTargetColsPerSec = 130.0;
+    scopeSamplesPerCol_ = juce::jmax(1, (int)std::lround(sampleRate / kScopeTargetColsPerSec));
+    scopeColsPerSec_ = sampleRate / scopeSamplesPerCol_;
+    scopeAcc_ = 0.0f;
+    scopeAccN_ = 0;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int s = 0; s < 2; ++s) { aiHpfX_[ch][s] = 0.0f; aiHpfY_[ch][s] = 0.0f; }
 }
 
 // Build this block's transport from the host playhead, or synthesize a free-
@@ -323,20 +343,59 @@ void PluginProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiB
         stageLen_ = juce::jmax(0, leftover);
     }
 
+    // Bass-input mode: high-pass the AI's OWN output so it can't double the input
+    // bass. The model generates left-hand bass intrinsically (sub-150 Hz stays
+    // ~65% even with the grounding high-passed), so the only robust fix is to
+    // strip it from the output — your bass holds the low end, the AI plays clean
+    // upper piano. Two cascaded 1st-order high-passes at ~140 Hz, stateful.
+    if (apvts_.getRawParameterValue("bassfocus")->load() > 0.5f && hostSampleRate_ > 0) {
+        const float ahp = (float)(hostSampleRate_ / (hostSampleRate_ + 2.0 * 3.14159265358979 * 140.0));
+        float* outs[2] = { outL, outR };
+        const int nCh = (outR == outL) ? 1 : 2;
+        for (int ch = 0; ch < nCh; ++ch)
+            for (int i = 0; i < nBlk; ++i) {
+                float x = outs[ch][i];
+                for (int s = 0; s < 2; ++s) {
+                    const float y = ahp * (aiHpfY_[ch][s] + x - aiHpfX_[ch][s]);
+                    aiHpfX_[ch][s] = x; aiHpfY_[ch][s] = y; x = y;
+                }
+                outs[ch][i] = x;
+            }
+    }
+
     // Dry passthrough mix + soft-clip + output gain.
     const float dryMix = apvts_.getRawParameterValue("drymix")->load();
     const float gain = juce::Decibels::decibelsToGain(apvts_.getRawParameterValue("outgain")->load());
     const bool haveDry = nIn > 0 && dryMix > 1e-5f;
     const bool captureAi = grid.playing && locked && (int)aiPushL_.size() >= nBlk;
+    const int dryR = juce::jmin(1, dry.getNumChannels() - 1);
     for (int i = 0; i < nBlk; ++i) {
-        float l = outL[i] * gain, r = outR[i] * gain;
+        const float aiL = outL[i] * gain, aiR = outR[i] * gain;  // generated layer
+        const float inL = nIn > 0 ? dry.getSample(0, i) : 0.0f;  // live input
+        const float inR = nIn > 0 ? dry.getSample(dryR, i) : 0.0f;
+        float l = aiL, r = aiR;
         if (captureAi) { aiPushL_[(size_t)i] = l; aiPushR_[(size_t)i] = r; }
         if (haveDry) {
-            l += dry.getSample(0, i) * dryMix;
-            r += dry.getSample(juce::jmin(1, dry.getNumChannels() - 1), i) * dryMix;
+            l += inL * dryMix;
+            r += inR * dryMix;
         }
         outL[i] = softClip(l);
         outR[i] = softClip(r);
+        // Live scope: the full ensemble = generated layer + live input at unity,
+        // INDEPENDENT of the Dry Mix routing, so the display reflects what's
+        // actually being played (input) and generated, not just what's mixed to
+        // the output. Fold into a max-abs peak, emit one column every
+        // scopeSamplesPerCol_ samples. Lock-free push to the editor's SPSC ring
+        // (release pairs with the editor's acquire).
+        scopeAcc_ = std::max(scopeAcc_,
+                             std::max(std::abs(aiL + inL), std::abs(aiR + inR)));
+        if (++scopeAccN_ >= scopeSamplesPerCol_) {
+            const uint64_t w = scopeWrite_.load(std::memory_order_relaxed);
+            scopeRing_[(size_t)(w & (kScopeRingCap - 1))] = scopeAcc_;
+            scopeWrite_.store(w + 1, std::memory_order_release);
+            scopeAcc_ = 0.0f;
+            scopeAccN_ = 0;
+        }
     }
     // Track our own layer in lockstep with the input capture so a re-ground
     // prefill can feed the model the actual ensemble (input + AI) it produced.
@@ -351,9 +410,11 @@ Knobs PluginProcessor::knobsFromParams() const {
     k.follow_input = apvts_.getRawParameterValue("follow")->load();
     k.drums = apvts_.getRawParameterValue("drums")->load() > 0.5f;
     k.variation = (int)apvts_.getRawParameterValue("variation")->load();
+    k.reharm = (int)apvts_.getRawParameterValue("reharm")->load();
     k.cfg_musiccoca = apvts_.getRawParameterValue("cfgstyle")->load();
     k.cfg_notes     = apvts_.getRawParameterValue("cfgnotes")->load();
     k.cfg_drums     = apvts_.getRawParameterValue("cfgdrums")->load();
+    k.temperature   = apvts_.getRawParameterValue("temp")->load();
     k.hint_density  = apvts_.getRawParameterValue("hintdensity")->load();
     k.hint_hold     = apvts_.getRawParameterValue("hinthold")->load();
     k.unmask_width  = (int)apvts_.getRawParameterValue("unmask")->load();
@@ -453,6 +514,10 @@ void PluginProcessor::workerLoop() {
         const int bars = juce::jmax(1, (int)apvts_.getRawParameterValue("bars")->load());
 
         AnalyzerConfig acfg;
+        // Bass focus: low-pass the analysis input so drums don't corrupt the
+        // detected harmony or flood the onset detector (the bass carries the
+        // harmony; cymbals/snare are noise to it). On by default for bass+drums.
+        if (apvts_.getRawParameterValue("bassfocus")->load() > 0.5f) acfg.bass_focus_hz = 300.0f;
         const bool userKeyLock = apvts_.getRawParameterValue("keylock")->load() > 0.5f;
         if (userKeyLock) {
             acfg.key_lock_tonic = (int)apvts_.getRawParameterValue("keytonic")->load();
@@ -665,6 +730,26 @@ void PluginProcessor::workerLoop() {
     }
 }
 
+// In-place high-pass of interleaved stereo (low-pass cascade, then subtract).
+// Removes the bass from the grounding audio so the model plays ABOVE the input
+// instead of cloning it — the harmony still arrives via the note hints. Mirror
+// of Bass Focus's analysis low-pass: low-pass to HEAR the bass harmony, high-pass
+// the grounding so the AI doesn't reproduce the bass (verified: drops the AI's
+// sub-150 Hz share from ~60% to ~40% in the long-run simulation).
+static void highpass_stereo(std::vector<float>& x, double fc, double sr, int order) {
+    const double a = 1.0 - std::exp(-2.0 * 3.14159265358979 * fc / sr);
+    const int N = (int)(x.size() / 2);
+    std::vector<float> low((size_t)N);
+    for (int ch = 0; ch < 2; ++ch) {
+        for (int i = 0; i < N; ++i) low[(size_t)i] = x[(size_t)(2 * i + ch)];
+        for (int o = 0; o < order; ++o) {
+            float s = 0.0f;
+            for (int i = 0; i < N; ++i) { s += (float)(a * (low[(size_t)i] - s)); low[(size_t)i] = s; }
+        }
+        for (int i = 0; i < N; ++i) x[(size_t)(2 * i + ch)] -= low[(size_t)i];
+    }
+}
+
 // Assemble grounding audio.
 //
 // Full grounding (refresher=false): the input loop tiled to >= 8 s so the
@@ -685,6 +770,12 @@ std::vector<float> PluginProcessor::buildPrefillAudio(const CapturedLoop& in, bo
     const int loopFrames = (int)(loop.size() / 2);
     if (loopFrames <= 0) return {};
 
+    // Bass-input mode: high-pass the grounding so the model plays piano ABOVE the
+    // bass rather than cloning it (the harmony comes from the note hints, which
+    // Bass Focus derived from the bass band). Same toggle as the analysis focus.
+    const bool bassFocus = apvts_.getRawParameterValue("bassfocus")->load() > 0.5f;
+    if (bassFocus) highpass_stereo(loop, 200.0, 48000.0, 2);
+
     if (!refresher) {
         constexpr int kMinPrefill = 8 * 48000;
         std::vector<float> pre;
@@ -699,6 +790,10 @@ std::vector<float> PluginProcessor::buildPrefillAudio(const CapturedLoop& in, bo
     ownLayerAmount = juce::jlimit(0.0f, 1.0f, ownLayerAmount);
     if (ownLayerAmount > 1.0e-5f && aiCapture_.snapshot(ai) && ai.valid && ai.rms > 1e-4) {
         const size_t n = std::min(loop.size(), ai.stereo48k.size());
+        // Same high-pass on the fed-back layer: reinforce the PIANO we played,
+        // not whatever bass crept into it — so Ctx Feedback can fight regression
+        // without re-injecting bass (the tradeoff the user hit).
+        if (bassFocus) highpass_stereo(ai.stereo48k, 200.0, 48000.0, 2);
         // Our layer should sit just under the input in the context mix;
         // boost-only (never duck a healthy layer), capped at +12 dB.
         const float boost = ownLayerAmount *

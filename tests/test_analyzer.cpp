@@ -53,6 +53,15 @@ int main() {
         CHECK(a.key.name() == "A minor", "key is A minor");
         CHECK(progression(a) == "Am Dm E Am", "progression Am Dm E Am");
         CHECK(!a.degraded, "not degraded");
+        // Onset detection: a tone is struck on every one of the 16 beats, so we
+        // expect ~one onset per beat (allow slack for the loop-wrap edge), and
+        // each should land near an integer beat (within ~a 16th note).
+        std::printf("[chordal Am] onsets=%zu\n", a.onsets.size());
+        CHECK(a.onsets.size() >= 14 && a.onsets.size() <= 18, "one onset per beat (~16)");
+        bool on_grid = true;
+        for (const auto& o : a.onsets)
+            if (std::fabs(o.beat - std::round(o.beat)) > 0.25f) on_grid = false;
+        CHECK(on_grid, "onsets land near their beats");
     }
     // 2) Chordal C major in a different tempo: C F G C (generality, no A-hardcode).
     {
@@ -93,6 +102,28 @@ int main() {
         std::printf("[atonal] level=%d tonality=%.2f degraded=%d\n", (int)a.level, a.tonality, a.degraded);
         CHECK(a.level == HarmonyLevel::None, "drum-like input -> HarmonyLevel::None");
         CHECK(a.degraded, "atonal -> degraded (user key fallback)");
+    }
+
+    // 5) Viterbi chord smoothing: an all-Am loop with ONE beat spiked by a
+    //    deceptive louder C-major triad. Per-beat argmax (stay_bonus=0) flips
+    //    that beat to C; the Viterbi decode, anchored by the surrounding Am
+    //    context, holds it — a single off-beat can no longer flap the chord.
+    {
+        const double spb = 0.5;  // 120 BPM
+        std::vector<float> buf((size_t)(16 * spb * SR), 0.0f);
+        for (int beat = 0; beat < 16; ++beat) {
+            for (int n : {57, 60, 64}) tone(buf, beat * spb, spb * 0.95, midi_hz(n), 0.3);  // Am
+            if (beat == 6) for (int n : {60, 64, 67}) tone(buf, beat * spb, spb * 0.95, midi_hz(n), 0.5);  // +C
+        }
+        auto off_am = [](const Analysis& a) {
+            int d = 0; for (auto& c : a.beats) if (c.name() != "Am") ++d; return d;
+        };
+        AnalyzerConfig raw; raw.chord_stay_bonus = 0.0f; raw.chord_diatonic_bias = 0.0f;
+        Analysis ar = analyze_loop(buf.data(), (int)buf.size(), SR, 120, 4, 4, raw);
+        Analysis as = analyze_loop(buf.data(), (int)buf.size(), SR, 120, 4, 4);  // default smoothing
+        std::printf("[viterbi] raw off-Am=%d  smoothed off-Am=%d\n", off_am(ar), off_am(as));
+        CHECK(off_am(ar) >= 1, "per-beat argmax flips the spiked beat");
+        CHECK(off_am(as) == 0, "Viterbi holds the chord through the spike");
     }
 
     std::printf(g_fail ? "\nFAILED (%d)\n" : "\nALL PASS\n", g_fail);

@@ -45,9 +45,11 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     attach(cfgDrums_, "CFG Drums", "cfgdrums", cfgDrumsA_);
     attach(bars_, "Bars", "bars", barsA_);
     attach(variation_, "Variation", "variation", variationA_);
+    attach(reharm_, "Reharm", "reharm", reharmA_);
     attach(dryMix_, "Dry Mix", "drymix", dryMixA_);
     attach(outGain_, "Out Gain", "outgain", outGainA_);
     channelLabFirst_ = (int)knobs_.size();
+    attach(temp_, "Temp", "temp", tempA_);
     attach(contextFeedback_, "Ctx Feedback", "contextfeedback", contextFeedbackA_);
     attach(contextRefresh_, "Ctx Bars", "contextrefresh", contextRefreshA_);
     attach(styleBlend_, "Style Blend", "styleblend", styleBlendA_);
@@ -66,10 +68,11 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     // Picking a key/scale engages Lock (so the dropdowns "just work"); the Lock
     // toggle stays as the explicit Auto<->Lock control.
     keyBox_.addListener(this); scaleBox_.addListener(this);
-    for (auto* t : { &keyLock_, &drums_, &noteGuide_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
+    for (auto* t : { &keyLock_, &drums_, &noteGuide_, &bassFocus_ }) { t->setLookAndFeel(&lnf_); addAndMakeVisible(*t); }
     keyLockA_   = std::make_unique<ButtonAttach>(proc_.apvts(), "keylock", keyLock_);
     drumsA_     = std::make_unique<ButtonAttach>(proc_.apvts(), "drums", drums_);
     noteGuideA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "noteguide", noteGuide_);
+    bassFocusA_ = std::make_unique<ButtonAttach>(proc_.apvts(), "bassfocus", bassFocus_);
 
     relock_.setLookAndFeel(&lnf_);
     relock_.onClick = [this] {
@@ -85,8 +88,8 @@ PluginEditor::PluginEditor(PluginProcessor& p)
     resetHist_.onClick = [this] { proc_.resetHistory(); };
     addAndMakeVisible(resetHist_);
 
-    setSize(560, 846);
-    startTimerHz(8);
+    setSize(560, 946);   // +100 for the extra Channel Lab row (Temp knob)
+    startTimerHz(60);   // 60 fps for the live sliding scope; status refreshes every 8th tick
     constructed_ = true;
 }
 
@@ -144,9 +147,10 @@ void PluginEditor::resized() {
     keyRow.removeFromLeft(10);
     scaleBox_.setBounds(keyRow.removeFromLeft(84).reduced(0, 3));
     keyRow.removeFromLeft(14);
-    keyLock_.setBounds(keyRow.removeFromLeft(70));
-    drums_.setBounds(keyRow.removeFromRight(90));
-    noteGuide_.setBounds(keyRow.removeFromRight(120));
+    keyLock_.setBounds(keyRow.removeFromLeft(64));
+    noteGuide_.setBounds(keyRow.removeFromRight(104));
+    drums_.setBounds(keyRow.removeFromRight(64));
+    bassFocus_.setBounds(keyRow.removeFromRight(100));
     r.removeFromTop(16);
 
     auto buttonRow = r.removeFromTop(42);
@@ -208,19 +212,24 @@ void PluginEditor::paint(juce::Graphics& g) {
                    : juce::String("click the button below to download");
         g.drawText(dmsg, wb.withTrimmedBottom(wb.getHeight() - 22.0f).toNearestInt(),
                    juce::Justification::centred, false);
-    } else if (!wave_.empty()) {
-        const float mid = wb.getCentreY(), hh = wb.getHeight() * 0.42f;
-        const float step = wb.getWidth() / (float)wave_.size();
-        g.setColour(ui::muted.withAlpha(0.85f));
-        for (size_t i = 0; i < wave_.size(); ++i) {
-            float a = juce::jlimit(0.0f, 1.0f, wave_[i]) * hh;
-            float x = wb.getX() + i * step;
-            g.fillRect(juce::Rectangle<float>(x, mid - a, juce::jmax(1.0f, step - 1.0f), a * 2));
-        }
     } else {
-        g.setColour(ui::faint); g.setFont(ui::font(13.0f));
-        g.drawText(proc_.uiPlaying() ? "listening for a loop" + ELL : juce::String("play your loop to capture"),
-                   waveBounds_, juce::Justification::centred, false);
+        // Live output scope: sliding waveform of the final mix (what you hear),
+        // newest column at the right edge. A faint centre line shows silence
+        // (flat) when nothing is playing.
+        const float mid = wb.getCentreY(), hh = wb.getHeight() * 0.42f;
+        g.setColour(ui::track);
+        g.fillRect(juce::Rectangle<float>(wb.getX() + 2.0f, mid - 0.5f, wb.getWidth() - 4.0f, 1.0f));
+        if (!scope_.empty()) {
+            const float step = wb.getWidth() / (float)scope_.size();
+            const bool live = proc_.uiPlaying() && proc_.uiLocked();
+            g.setColour((live ? ui::accent : ui::muted).withAlpha(0.9f));
+            for (size_t i = 0; i < scope_.size(); ++i) {
+                float a = juce::jlimit(0.0f, 1.0f, scope_[i]) * hh;
+                if (a < 0.5f) continue;  // skip silent columns (the centre line shows through)
+                float x = wb.getX() + i * step;
+                g.fillRect(juce::Rectangle<float>(x, mid - a, juce::jmax(1.0f, step - 0.5f), a * 2.0f));
+            }
+        }
     }
     g.setColour(ui::muted); g.setFont(ui::font(12.5f));
     g.drawText(detectLine_, juce::Rectangle<int>(waveBounds_.getX(), waveBounds_.getBottom() + 4,
@@ -235,7 +244,7 @@ void PluginEditor::paint(juce::Graphics& g) {
         g.setColour(ui::muted); g.setFont(ui::font(11.5f));
         g.drawText(k.name, cell.removeFromTop(15).expanded(6, 0), juce::Justification::centred, false);
         g.setColour(ui::text); g.setFont(ui::font(12.0f, true));
-        juce::String v = (k.name == "Bars" || k.name == "Variation" ||
+        juce::String v = (k.name == "Bars" || k.name == "Variation" || k.name == "Reharm" ||
                           k.name == "Unmask" || k.name == "Ctx Bars")
             ? juce::String((int)k.s->getValue())
             : juce::String(k.s->getValue(), 2);
@@ -254,12 +263,24 @@ void PluginEditor::paint(juce::Graphics& g) {
 }
 
 void PluginEditor::timerCallback() {
-    int n = proc_.copyWaveform(wave_);
-    juce::ignoreUnused(n);
-
-    // Asset-download flow takes over the button + readout until the model is local.
+    ++tick_;
     using AS = PluginProcessor::AssetState;
     const AS as = proc_.assetState();
+
+    // 60 fps: advance the live output scope and repaint ONLY the waveform panel
+    // (the rest of the UI is static between status ticks). The download flow
+    // owns the panel until the model is local, so skip the scope until then.
+    const bool modelReady = (as != AS::NeedsDownload && as != AS::Downloading && as != AS::Failed);
+    if (modelReady) {
+        proc_.copyScope(scope_, kScopeCols);
+        repaint(waveBounds_);
+    }
+
+    // Status lines + button text are far cheaper than 60 fps warrants — refresh
+    // them (and do a full repaint) every 8th tick (~7.5 fps, the old rate).
+    if (tick_ % 8 != 0) return;
+
+    // Asset-download flow takes over the button + readout until the model is local.
     if (as == AS::NeedsDownload || as == AS::Downloading || as == AS::Failed) {
         resetHist_.setEnabled(false);   // no history to reset until the model is local
         const int pct = (int)std::round(proc_.downloadProgress() * 100.0f);

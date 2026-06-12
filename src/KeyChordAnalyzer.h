@@ -55,9 +55,17 @@ struct Chord {
     std::vector<int> pitch_classes() const;
 };
 
+// A detected note onset in the source loop, used to time the conditioning
+// hints to the input's actual rhythm instead of the rigid beat grid.
+struct Onset {
+    float beat = 0;      // fractional beat position, 0 .. beats_per_bar*bars
+    float strength = 0;  // 0..1, normalized spectral-flux novelty at the onset
+};
+
 struct Analysis {
     Key key;
     std::vector<Chord> beats;   // one entry per beat across the whole loop
+    std::vector<Onset> onsets;  // source note onsets (sorted by beat), for hint timing
     int beats_per_bar = 4;
     int bars = 0;
     Chroma loop_chroma{};       // loop-averaged, normalized (for debugging/UI)
@@ -81,6 +89,17 @@ struct AnalyzerConfig {
     float  key_conf_floor   = 0.04f;   // below -> Analysis.degraded = true
     float  richness_floor   = 0.22f;   // third-energy ratio below -> sparse/bass
     float  tonal_floor      = 0.62f;   // tonality below -> HarmonyLevel::None
+    // Viterbi chord smoothing. stay_bonus suppresses one-beat flaps (a passing
+    // tone can no longer flip a single beat's chord); diatonic_bias gently
+    // favors in-key qualities when the third is acoustically ambiguous.
+    float  chord_stay_bonus    = 0.15f;
+    float  chord_diatonic_bias = 0.10f;
+    // Bass-focus low-pass (Hz) applied to the analysis input before chroma,
+    // tonality, AND onset detection. 0 = off. Isolates the bass / low harmony so
+    // drum energy (cymbals, snare) can't corrupt the detected chords or flood the
+    // onset detector with hits. The plugin defaults this on for its bass(+drums)
+    // use case; headless tools/tests leave it off (0).
+    float  bass_focus_hz       = 0.0f;
     // Key override: -1 = auto-detect (Krumhansl-Schmuckler). Otherwise force this
     // tonic (0..11) + mode, used as the tonal centre for chord harmonization and
     // reporting. Useful because a bassline can't disambiguate major/minor.

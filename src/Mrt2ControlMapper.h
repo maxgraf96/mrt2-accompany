@@ -45,10 +45,10 @@ struct Knobs {
     // where the input leaves room). Set both >=0 to force a fixed register.
     int   register_lo = -1;
     int   register_hi = -1;
-    // Voice diatonic 7ths instead of bare triads (Am -> Am7, the V -> dom7).
-    // Triads fight a jazz prompt; extensions make the hints stylistically
-    // plausible. Off only matters for deliberately plain styles.
-    bool  seventh_chords = true;
+    // Progression-proposer selection (0 = literal triads, 1 = jazz diatonic 7ths;
+    // further reharmonization candidates are added in propose_progressions).
+    // Default 1 keeps the existing jazz-leaning sound. Atonal input ignores this.
+    int   reharm = 1;
     // User's Key field — the fallback harmony when the input is atonal
     // (HarmonyLevel::None). Also the lock target when the user locks the key.
     int   user_key_tonic = 9;     // pitch class, default A
@@ -61,6 +61,10 @@ struct Knobs {
     float cfg_musiccoca = kCfgUnset;
     float cfg_notes     = kCfgUnset;
     float cfg_drums     = kCfgUnset;
+    // Sampling temperature override. Left unset, derived from Freedom (1.0..1.5);
+    // set directly to decouple it (e.g. push higher for livelier, less literal
+    // playing without changing Freedom's style-CFG effect).
+    float temperature   = kCfgUnset;
     // Low-level Channel Lab controls. Left unset, they derive from Follow so
     // existing tools/tests and the musical macro keep their current behaviour.
     float hint_density  = kCfgUnset;  // -> re-articulation cadence
@@ -77,6 +81,11 @@ struct Knobs {
 // from echoing the bassline.
 inline float cfg_musiccoca_from_freedom(float freedom) {
     return std::clamp(4.5f - 1.5f * std::clamp(freedom, 0.0f, 1.0f), 0.0f, 8.0f);
+}
+// Freedom also sets the sampling temperature (1.0..1.5). Exposed so the macro
+// link and resolve_params agree, and so the Temp knob defaults track Freedom.
+inline float temperature_from_freedom(float freedom) {
+    return 1.0f + 0.5f * std::clamp(freedom, 0.0f, 1.0f);
 }
 // Linear over the FULL meaningful CFG range, so the knob reads literally:
 //   logits = cond + cfg * (cond - notes_blind)
@@ -147,6 +156,21 @@ std::vector<int> voice_pcs(const std::vector<int>& pcs, int lo, int hi);
 // major on the key's dominant -> b7 (dom7), other majors -> maj7,
 // minor/dim -> b7 (m7 / m7b5).
 std::vector<int> pcs_with_seventh(const Chord& chord, const Key& key);
+
+// A candidate harmonization of the loop: one pitch-class set per beat, ready to
+// voice. The proposer returns a few of these (all consistent with the detected
+// key/progression) so the comping can be more idiomatic than a literal
+// transcription and the player can audition takes. Candidate 0 is always the
+// literal triads; Knobs::reharm selects the active candidate.
+struct Progression {
+    std::string name;
+    std::vector<std::vector<int>> beat_pcs;  // pitch classes to voice, per beat
+};
+
+// Generate harmonization candidates for `a` (key + per-beat chords). Always
+// includes candidate 0 = literal triads; further candidates are reharmonized
+// flavors (currently jazz diatonic 7ths). One entry per beat in each candidate.
+std::vector<Progression> propose_progressions(const Analysis& a);
 
 // Fold the model's OWN detected harmony (analyzed from the captured AI layer)
 // back into the input-derived analysis, so reharmonizations the model plays

@@ -145,14 +145,19 @@ int main() {
         CHECK(all_handled, "notes held at plan end are handled at the wrap (no stuck notes)");
     }
 
-    // 8b) Follow-driven pulse density: at follow=0 the plan onsets ONLY at
-    //     chord changes (free rhythm, harmony as a whisper); at follow=1 it
-    //     pulses every beat (tight lock). Default macro maps to cfg_notes 2.
+    // 8b) Follow now drives SCAFFOLD COVERAGE (the Freedom morph), not CFG
+    //     strength. follow=0 is the FREE end: an empty scaffold (no hints — the
+    //     model improvises on its KV history). Raising it thickens the scaffold:
+    //     chord-change-only -> half-note pulse -> every beat.
     {
-        Knobs loose{0.5f, 0.0f, false, 0, 55, 79};
-        MidiPlan lp = build_midi_plan(a, 120.0, loose);
-        std::set<int> lof; for (auto& e : lp.events) if (e.on) lof.insert(e.frame);
-        CHECK((int)lof.size() == 4, "follow=0 -> onsets only at the 4 chord changes");
+        Knobs free_{0.5f, 0.0f, false, 0, 55, 79};
+        MidiPlan fp = build_midi_plan(a, 120.0, free_);
+        std::set<int> fof; for (auto& e : fp.events) if (e.on) fof.insert(e.frame);
+        CHECK(fof.empty(), "follow=0 -> free end: empty scaffold (no hints)");
+        Knobs sparse_{0.5f, 0.2f, false, 0, 55, 79};
+        MidiPlan sp = build_midi_plan(a, 120.0, sparse_);
+        std::set<int> sof; for (auto& e : sp.events) if (e.on) sof.insert(e.frame);
+        CHECK((int)sof.size() == 4, "follow=0.2 -> sparse: chord-change-only (4 onsets)");
         Knobs tight{0.5f, 1.0f, false, 0, 55, 79};
         MidiPlan tp = build_midi_plan(a, 120.0, tight);
         std::set<int> tof; for (auto& e : tp.events) if (e.on) tof.insert(e.frame);
@@ -215,7 +220,7 @@ int main() {
 
         Knobs sparseLocked{0.5f, 1.0f, false, 0, 55, 79};
         sparseLocked.cfg_notes = 6.5f;
-        sparseLocked.hint_density = 0.0f;
+        sparseLocked.hint_density = 0.2f;  // override coverage to sparse (above the free floor)
         sparseLocked.hint_hold = 0.0f;
         sparseLocked.unmask_width = 8;
         ep = resolve_params(sparseLocked);
@@ -237,13 +242,34 @@ int main() {
         Key cmajk; cmajk.tonic = 0; cmajk.mode = Mode::Major;
         CHECK(pcs(pcs_with_seventh(mk(0, Quality::Maj), cmajk)) == std::set<int>({0, 4, 7, 11}),
               "C (the I of C major) -> Cmaj7 (adds B)");
-        // seventh_chords=false keeps triads.
+        // Reharm 0 (literal triads) keeps bare triads; default (1) adds 7ths.
         Knobs plain; plain.register_lo = 55; plain.register_hi = 79;
-        plain.seventh_chords = false;
+        plain.reharm = 0;
         MidiPlan tp = build_midi_plan(a, 120.0, plain);
         std::set<int> p0;
         for (auto& e : tp.events) if (e.on && e.frame == 0) p0.insert(((e.pitch % 12) + 12) % 12);
-        CHECK(p0 == std::set<int>({9, 0, 4}), "seventh_chords=false -> plain Am triad");
+        CHECK(p0 == std::set<int>({9, 0, 4}), "reharm=0 -> plain Am triad (no 7th)");
+    }
+
+    // 8e2) Progression proposer over the Am Dm E Am loop (A minor key). Five
+    //      candidates: literal triads, jazz 7ths, and three reharmonizations.
+    {
+        auto props = propose_progressions(a);
+        auto pcset = [](std::vector<int> v) { return std::set<int>(v.begin(), v.end()); };
+        CHECK(props.size() == 5, "proposer returns 5 candidates");
+        CHECK(props[0].name == "Triads" && props[1].name == "Jazz 7ths" && props[2].name == "ii-V" &&
+              props[3].name == "Tritone" && props[4].name == "Reharm", "candidates named");
+        for (auto& p : props) CHECK((int)p.beat_pcs.size() == 16, "one pcs set per beat");
+        CHECK(pcset(props[0].beat_pcs[0]) == std::set<int>({9, 0, 4}), "Triads beat 0 = Am");
+        CHECK(pcset(props[1].beat_pcs[0]) == std::set<int>({9, 0, 4, 7}), "Jazz beat 0 = Am7");
+        // The Am span is beats 0-3, then Dm at beat 4. ii-V steals beat 3 for the
+        // secondary V7 of Dm = A7 {A C# E G}; Tritone uses its sub Eb7 {Eb G Bb Db}.
+        CHECK(pcset(props[2].beat_pcs[3]) == std::set<int>({9, 1, 4, 7}), "ii-V: beat 3 = A7 (V7/Dm)");
+        CHECK(pcset(props[2].beat_pcs[0]) == std::set<int>({9, 0, 4, 7}), "ii-V: strong beats stay Am7");
+        CHECK(pcset(props[3].beat_pcs[3]) == std::set<int>({3, 7, 10, 1}), "Tritone: beat 3 = Eb7 (bII7/Dm)");
+        // Reharm: Am (root A) -> the diatonic chord with A as its 3rd = F (VI of
+        // A minor), voiced Fmaj7 {F A C E}. Bass A sits as the 3rd.
+        CHECK(pcset(props[4].beat_pcs[0]) == std::set<int>({5, 9, 0, 4}), "Reharm: Am -> Fmaj7 (A is the 3rd)");
     }
 
     // 8e) Harmonic feedback merge: the model's own detected chords fold into

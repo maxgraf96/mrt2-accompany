@@ -64,6 +64,11 @@ target_include_directories(diag_runner PRIVATE src "${MAGENTA_COMMON_DIR}/cpp")
 target_link_libraries(diag_runner PRIVATE magentart::core mrt2_analyzer)
 magenta_deploy_metallib(diag_runner)
 
+add_executable(diag_regress tools/diag_regress.cpp src/AccompanyRunner.cpp ${MAGENTA_PATHS_SRC})
+target_include_directories(diag_regress PRIVATE src "${MAGENTA_COMMON_DIR}/cpp")
+target_link_libraries(diag_regress PRIVATE magentart::core mrt2_analyzer)
+magenta_deploy_metallib(diag_regress)
+
 # ── M4: JUCE plugin (AU / VST3 / Standalone) ─────────────────────────────────
 option(MRT2_BUILD_PLUGIN "Build the JUCE AU/VST3/Standalone plugin" ON)
 if(MRT2_BUILD_PLUGIN)
@@ -86,6 +91,11 @@ if(MRT2_BUILD_PLUGIN)
         NEEDS_MIDI_INPUT FALSE
         NEEDS_MIDI_OUTPUT FALSE
         IS_MIDI_EFFECT FALSE
+        # The Standalone captures the input loop from a live audio device; under
+        # the hardened runtime (required for notarization) macOS kills the app on
+        # mic access unless the usage description is present in Info.plist.
+        MICROPHONE_PERMISSION_ENABLED TRUE
+        MICROPHONE_PERMISSION_TEXT "MRT2-Accompany listens to your audio input to capture the loop it accompanies."
         # Skip the build-time VST3 manifest helper: it instantiates the plugin,
         # which would load the 2.6 GB MLX model and abort on teardown (MLX's
         # single global Metal stream). Hosts scan the binary directly without it.

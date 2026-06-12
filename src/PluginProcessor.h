@@ -13,6 +13,7 @@
 #include "AssetManager.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -112,6 +113,24 @@ public:
         dest = wavePeaks_; return (int)dest.size();
     }
 
+    // Live output scope (audio thread -> editor). The audio thread folds the
+    // final post-mix output into a max-abs peak every `scopeSamplesPerCol_`
+    // samples and pushes one column into a lock-free SPSC ring; the editor
+    // copies the most recent `count` columns each frame to draw a sliding
+    // waveform. `count` columns span count / scopeColumnsPerSec() seconds.
+    // Fills the leading slots with 0 (flat line) until the ring has filled.
+    int copyScope(std::vector<float>& dest, int count) const {
+        const uint64_t w = scopeWrite_.load(std::memory_order_acquire);
+        if ((int)dest.size() != count) dest.assign((size_t)count, 0.0f);
+        for (int i = 0; i < count; ++i) {
+            const long long col = (long long)w - count + i;
+            dest[(size_t)i] = col < 0 ? 0.0f
+                : scopeRing_[(size_t)(col & (kScopeRingCap - 1))];
+        }
+        return count;
+    }
+    double scopeColumnsPerSec() const { return scopeColsPerSec_; }
+
     // Editor sets the style prompt (message thread).
     void setPrompt(const juce::String& p);
     juce::String getPrompt() const;
@@ -208,6 +227,26 @@ private:
     std::atomic<bool> resetHistoryPending_{false};  // Reset-history button: armed
     mutable juce::SpinLock waveLock_;
     std::vector<float> wavePeaks_;   // captured-loop waveform peaks (worker-set)
+
+    // Live output scope: lock-free SPSC ring of per-column peaks (audio thread
+    // is the sole producer, the editor the sole consumer). Cap is a power of
+    // two so the index wraps with a mask. Sized for several seconds of history
+    // at ~130 columns/s; the editor only reads the most recent window.
+    static constexpr int kScopeRingCap = 2048;
+    std::array<float, kScopeRingCap> scopeRing_{};
+    std::atomic<uint64_t> scopeWrite_{0};   // total columns ever written
+    float  scopeAcc_ = 0.0f;                // audio-thread peak accumulator
+    int    scopeAccN_ = 0;                  // samples folded into scopeAcc_
+    int    scopeSamplesPerCol_ = 369;       // recomputed in prepareToPlay
+    double scopeColsPerSec_ = 130.0;
+
+    // Output high-pass state (per channel, 2 cascaded 1st-order stages). With
+    // Bass Focus on, strips the AI's OWN low octave so it can't double the input
+    // bass — the model generates left-hand bass intrinsically (the long-run
+    // analysis showed ~65% sub-150 Hz output even with the grounding high-passed,
+    // and it survives factory resets). Reset in prepareToPlay.
+    float  aiHpfX_[2][2] = {{0, 0}, {0, 0}};
+    float  aiHpfY_[2][2] = {{0, 0}, {0, 0}};
 
     AccompanyRunner runner_;
     juce::AudioProcessorValueTreeState apvts_;

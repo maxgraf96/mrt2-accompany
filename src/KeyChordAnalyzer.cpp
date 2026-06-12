@@ -272,6 +272,147 @@ int root_histogram_tonic(const std::vector<Chroma>& beats) {
     return (int)(std::max_element(hist.begin(), hist.end()) - hist.begin());
 }
 
+// Template-correlation emission for all 24 maj/min triads of one beat chroma.
+// State index s = root*2 + (quality == Min ? 1 : 0). pearson is scale-invariant,
+// so a bass root (root + 5th-harmonic fifth both present) already scores its own
+// triad above neighbours; the third, when played, breaks maj vs min.
+void triad_emissions(const Chroma& c, std::array<float, 24>& score) {
+    for (int r = 0; r < 12; ++r)
+        for (int qi = 0; qi < 2; ++qi) {
+            std::array<float, 12> tpl{};
+            const int third = qi ? 3 : 4;
+            tpl[r] = 1; tpl[(r + third) % 12] = 1; tpl[(r + 7) % 12] = 1;
+            score[(size_t)(r * 2 + qi)] = pearson(c, tpl);
+        }
+}
+
+// Viterbi-decode a temporally coherent maj/min chord per beat. Emission = triad
+// template correlation + a diatonic-quality bias (in the corrected key);
+// transition = a self-stay bonus, so a single off-beat can't flip the chord
+// while a genuine change (larger emission margin) still wins. Returns one state
+// index per beat (root*2 + quality bit).
+std::vector<int> viterbi_chords(const std::vector<Chroma>& beats, const Key& key,
+                                float stayBonus, float diatonicBias) {
+    const int B = (int)beats.size();
+    std::vector<int> out((size_t)std::max(0, B), 0);
+    if (B == 0) return out;
+    constexpr int S = 24;
+    std::array<float, S> bias{};
+    for (int r = 0; r < 12; ++r)
+        for (int qi = 0; qi < 2; ++qi)
+            bias[(size_t)(r * 2 + qi)] =
+                (diatonic_quality(r, key) == (qi ? Quality::Min : Quality::Maj)) ? diatonicBias : 0.0f;
+
+    std::vector<std::array<float, S>> dp((size_t)B);
+    std::vector<std::array<int, S>> bp((size_t)B);
+    std::array<float, S> em{};
+    triad_emissions(beats[0], em);
+    for (int s = 0; s < S; ++s) { dp[0][(size_t)s] = em[(size_t)s] + bias[(size_t)s]; bp[0][(size_t)s] = -1; }
+    for (int b = 1; b < B; ++b) {
+        triad_emissions(beats[(size_t)b], em);
+        for (int s = 0; s < S; ++s) {
+            float best = -1e30f; int arg = 0;
+            for (int p = 0; p < S; ++p) {
+                const float v = dp[(size_t)(b - 1)][(size_t)p] + (p == s ? stayBonus : 0.0f);
+                if (v > best) { best = v; arg = p; }
+            }
+            dp[(size_t)b][(size_t)s] = best + em[(size_t)s] + bias[(size_t)s];
+            bp[(size_t)b][(size_t)s] = arg;
+        }
+    }
+    int s = (int)(std::max_element(dp[(size_t)(B - 1)].begin(), dp[(size_t)(B - 1)].end())
+                  - dp[(size_t)(B - 1)].begin());
+    for (int b = B - 1; b >= 0; --b) { out[(size_t)b] = s; s = bp[(size_t)b][(size_t)s]; }
+    return out;
+}
+
+// Spectral-flux onset detection over the whole loop. Returns onsets as
+// fractional-beat positions with a normalized strength (0..1). Broadband
+// positive flux catches bass plucks / re-articulations; a legato passage with
+// no transient simply yields few onsets, and the plan falls back to the beat
+// grid there. Runs offline on the worker, so a per-hop FFT is cheap.
+std::vector<Onset> detect_onsets(const float* x, int n, double sample_rate,
+                                 double samples_per_beat, int total_beats) {
+    std::vector<Onset> out;
+    const int W = 1024;   // ~21 ms window @ 48k
+    const int H = 256;    // ~5.3 ms hop -> fine onset timing
+    const int half = W / 2;
+    if (n < W * 2 || samples_per_beat <= 0) return out;
+    const int frames = (n - W) / H + 1;
+    if (frames < 4) return out;
+
+    std::vector<float> win((size_t)W);
+    for (int i = 0; i < W; ++i)
+        win[(size_t)i] = 0.5f * (1.0f - std::cos(2.0f * (float)kPi * i / (W - 1)));
+
+    std::vector<float> flux((size_t)frames, 0.0f);
+    std::vector<float> prevMag((size_t)half, 0.0f);
+    std::vector<std::complex<float>> buf((size_t)W);
+    for (int f = 0; f < frames; ++f) {
+        const int s0 = f * H;
+        for (int i = 0; i < W; ++i)
+            buf[(size_t)i] = std::complex<float>(x[s0 + i] * win[(size_t)i], 0.0f);
+        fft(buf);
+        float fl = 0.0f;
+        for (int k = 0; k < half; ++k) {
+            // Log-compress the magnitude so a single loud attack doesn't bury the
+            // detector in its own decay ripple (a struck/decaying note otherwise
+            // throws a cluster of secondary flux peaks during its tail).
+            const float mag = std::log1p(20.0f * std::abs(buf[(size_t)k]));
+            const float d = mag - prevMag[(size_t)k];
+            if (d > 0) fl += d;
+            prevMag[(size_t)k] = mag;
+        }
+        flux[(size_t)f] = fl;
+    }
+
+    float mx = 0.0f; for (float v : flux) mx = std::max(mx, v);
+    if (mx <= 1e-9f) return out;
+    for (float& v : flux) v /= mx;
+
+    // Adaptive peak-pick: a frame is an onset if it is a local max over +-w and
+    // rises `delta` above the local mean. Two gates suppress the decay-tail
+    // retriggers of one note: a refractory minimum gap, and a hysteresis re-arm
+    // that blocks new onsets until the flux falls back below a fraction of the
+    // last peak (so one attack -> one onset, even as it rings out).
+    const int w = 3;                                   // local-max half-window (~16 ms)
+    const int M = 20;                                  // mean half-window (~107 ms)
+    const float delta = 0.10f;
+    const float reArmFrac = 0.40f;                     // re-arm once flux < 0.40 * last peak
+    const long minGap = (long)(sample_rate * 0.09);    // 90 ms refractory
+    long lastOnset = -(1L << 30);
+    float lastPeak = 0.0f;
+    bool armed = true;
+    for (int f = 0; f < frames; ++f) {
+        const float v = flux[(size_t)f];
+        if (!armed) {
+            if (v < reArmFrac * lastPeak) armed = true;
+            else continue;
+        }
+        bool localMax = true;
+        for (int j = std::max(0, f - w); j <= std::min(frames - 1, f + w); ++j)
+            if (flux[(size_t)j] > v) { localMax = false; break; }
+        if (!localMax) continue;
+        float mean = 0; int cnt = 0;
+        for (int j = std::max(0, f - M); j <= std::min(frames - 1, f + M); ++j) {
+            mean += flux[(size_t)j]; ++cnt;
+        }
+        mean = cnt ? mean / cnt : 0.0f;
+        if (v < mean + delta) continue;
+        const long smp = (long)f * H + half;           // report at the window centre
+        if (smp - lastOnset < minGap) continue;
+        lastOnset = smp;
+        lastPeak = v;
+        armed = false;
+        Onset o;
+        o.beat = (float)(smp / samples_per_beat);
+        if (o.beat >= (float)total_beats) continue;
+        o.strength = v;
+        out.push_back(o);
+    }
+    return out;
+}
+
 }  // namespace
 
 Analysis analyze_loop(const float* mono, int n, double sample_rate,
@@ -283,6 +424,24 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
     const int total_beats = std::max(1, beats_per_bar * bars);
     const double samples_per_beat = sample_rate * 60.0 / bpm;
 
+    // Optional bass-focus low-pass: isolate the low/harmonic band so drums don't
+    // corrupt the chroma/tonality or flood the onset detector. A 4th-order
+    // one-pole cascade (~24 dB/oct); applied once and reused by every stage.
+    std::vector<float> focus;
+    const float* src = mono;
+    if (cfg.bass_focus_hz > 0.0f && n > 0) {
+        focus.assign(mono, mono + n);
+        const double alpha = 1.0 - std::exp(-2.0 * kPi * cfg.bass_focus_hz / sample_rate);
+        for (int o = 0; o < 4; ++o) {
+            float s = 0.0f;
+            for (int i = 0; i < n; ++i) {
+                s += (float)(alpha * (focus[(size_t)i] - s));
+                focus[(size_t)i] = s;
+            }
+        }
+        src = focus.data();
+    }
+
     // Per-beat chroma + loop-average.
     std::vector<Chroma> beat_chroma(total_beats);
     Chroma loop{};
@@ -290,7 +449,7 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
         int s0 = (int)std::llround(b * samples_per_beat);
         int s1 = (int)std::llround((b + 1) * samples_per_beat);
         s0 = std::clamp(s0, 0, n); s1 = std::clamp(s1, 0, n);
-        beat_chroma[b] = chroma_from_segment(mono + s0, s1 - s0, sample_rate, cfg);
+        beat_chroma[b] = chroma_from_segment(src + s0, s1 - s0, sample_rate, cfg);
         for (int i = 0; i < 12; ++i) loop[i] += beat_chroma[b][i];
     }
     normalize(loop);
@@ -304,14 +463,12 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
         a.key.mode = cfg.key_lock_major ? Mode::Major : Mode::Minor;
         a.key.confidence = 1.0f;
     }
-    spectral_profile(mono, n, sample_rate, cfg, a.pitch_energy, a.tonality);
+    spectral_profile(src, n, sample_rate, cfg, a.pitch_energy, a.tonality);
 
-    // Per-beat tier selection: a beat is a real, quality-bearing chord only if
-    // its best triad correlates well AND that triad's third actually sounds.
-    // Otherwise it's root+fifth (a bassline) — take the bass fundamental as root
-    // and harmonize the quality from the key. Decoupling this from any global
-    // average keeps confident chord beats out of the bass fallback.
-    a.beats.resize(total_beats);
+    // Evidence pass (no commitment yet): the per-beat best triad + whether its
+    // third actually sounds give the richness / sparse determination, kept
+    // independent of the final decode so it still measures "does the loop carry
+    // real thirds?" exactly as before.
     float third_sum = 0;
     int templated = 0;
     for (int b = 0; b < total_beats; ++b) {
@@ -319,18 +476,7 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
         int third_pc = (tr + (tq == Quality::Maj ? 4 : 3)) % 12;
         float tp = third_presence(beat_chroma[b], tr, third_pc);
         third_sum += tp;
-        Chord ch;
-        if (ts >= cfg.chord_conf_floor && tp >= cfg.richness_floor) {
-            ch.root = tr; ch.quality = tq; ch.confidence = ts; ch.from_template = true;
-            ++templated;
-        } else {
-            int root = dominant_pc(beat_chroma[b]);  // bass fundamental
-            ch.root = root;
-            ch.quality = diatonic_quality(root, a.key);
-            ch.confidence = std::max(0.0f, ts);
-            ch.from_template = false;
-        }
-        a.beats[b] = ch;
+        if (ts >= cfg.chord_conf_floor && tp >= cfg.richness_floor) ++templated;
     }
     a.harmonic_richness = third_sum / total_beats;
 
@@ -344,14 +490,55 @@ Analysis analyze_loop(const float* mono, int n, double sample_rate,
         a.key.confidence = std::min(a.key.confidence, cfg.key_conf_floor);
     }
 
+    // Coherent chord decode: Viterbi over the 24 maj/min triads with a diatonic
+    // bias (in the now-corrected key) and a self-stay bonus, so the progression
+    // is temporally smooth instead of 16 independent argmax guesses. Two-tier
+    // semantics preserved: where the decoded triad's third actually sounds we
+    // keep its quality (template tier); where it doesn't we harmonize from the
+    // key (bass tier) — now on a stable, smoothed root sequence.
+    const auto states = viterbi_chords(beat_chroma, a.key,
+                                       cfg.chord_stay_bonus, cfg.chord_diatonic_bias);
+    a.beats.resize(total_beats);
+    for (int b = 0; b < total_beats; ++b) {
+        const int root = states[(size_t)b] / 2;
+        const Quality decoded = (states[(size_t)b] % 2) ? Quality::Min : Quality::Maj;
+        const int third_pc = (root + (decoded == Quality::Maj ? 4 : 3)) % 12;
+        const float tp = third_presence(beat_chroma[b], root, third_pc);
+        Chord ch;
+        ch.root = root;
+        if (tp >= cfg.richness_floor) {
+            ch.quality = decoded;                        // template tier: third sounds
+            ch.from_template = true;
+        } else {
+            ch.quality = diatonic_quality(root, a.key);  // bass tier: harmonize from key
+            ch.from_template = false;
+        }
+        std::array<float, 12> tpl{};
+        const int thd = decoded == Quality::Maj ? 4 : 3;
+        tpl[(size_t)root] = 1;
+        tpl[(size_t)((root + thd) % 12)] = 1;
+        tpl[(size_t)((root + 7) % 12)] = 1;
+        ch.confidence = std::max(0.0f, pearson(beat_chroma[b], tpl));
+        a.beats[b] = ch;
+    }
+
     // 3-rung harmony level (BRIEF generalized to any input):
     //   atonal/percussive       -> None  (caller uses the user's Key field)
     //   pitched but sparse/bass  -> KeyScale
     //   rich harmony             -> Chords
-    if (a.tonality < cfg.tonal_floor)      a.level = HarmonyLevel::None;
-    else if (sparse)                       a.level = HarmonyLevel::KeyScale;
-    else                                   a.level = HarmonyLevel::Chords;
+    // A LOCKED key is the user asserting the input is tonal, so never fall to
+    // None — drum-heavy mixes (bass + drums) read as low-tonality and would
+    // otherwise bypass the harmony path + reharm and just pad the user tonic.
+    // Honor the lock: treat them as KeyScale and let the bass-derived roots,
+    // smoothed to the locked key, drive the hints (and the Reharm proposer).
+    if (a.tonality < cfg.tonal_floor && !key_locked) a.level = HarmonyLevel::None;
+    else if (sparse || a.tonality < cfg.tonal_floor) a.level = HarmonyLevel::KeyScale;
+    else                                             a.level = HarmonyLevel::Chords;
     a.degraded = (a.level != HarmonyLevel::Chords);
+
+    // Source note onsets, for timing the conditioning hints to the input's
+    // actual rhythm (the mapper places hints here instead of on the beat grid).
+    a.onsets = detect_onsets(src, n, sample_rate, samples_per_beat, total_beats);
     return a;
 }
 
